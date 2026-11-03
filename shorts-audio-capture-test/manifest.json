@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Japanese Learning Audio Capture Test",
+  "version": "0.2.0",
+  "description": "Records five seconds of YouTube audio and sends it to a local Google Speech-to-Text bridge when available.",
+  "minimum_chrome_version": "116",
+  "permissions": ["activeTab", "offscreen", "scripting", "tabCapture"],
+  "host_permissions": ["http://127.0.0.1:8765/*"],
+  "action": {
+    "default_title": "Test five seconds of tab audio"
+  },
+  "background": {
+    "service_worker": "service-worker.js"
+  }
+}
