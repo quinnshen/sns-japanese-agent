@@ -1,0 +1,38 @@
+# Local environments, tools and caches
+.venv/
+venv/
+.tools/
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Secrets and cloud account configuration
+.env
+.env.*
+.config/
+.credentials/
+.aws/
+gcloud/
+application_default_credentials.json
+credentials*.json
+client_secret*.json
+token*.json
+*service-account*.json
+*service_account*.json
+id_rsa
+id_ed25519
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+
+# Recordings, transcripts and logs
+data/
+uploads/
+*.webm
+*.wav
+*.mp3
+*.mp4
+*.mov
+*.log
