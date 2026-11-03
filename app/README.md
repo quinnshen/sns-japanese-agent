@@ -1,4 +1,4 @@
-# Short-video Japanese learning demo
+# SNS Japanese Agent
 
 A Chrome extension and local Python service that turn a Japanese YouTube video into a sentence timeline, synchronized Japanese/Chinese captions and precomputed learning notes. Click a sentence to seek; click its analysis button to reveal saved explanations without another model request.
 
@@ -29,18 +29,19 @@ Requires Chrome 116+, Python 3.11+ and your own Google Cloud project with billin
 From the repository root:
 
 ```sh
-cd short-video-demo/backend
+cd app/backend
 python3.11 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
-GOOGLE_CLOUD_PROJECT=YOUR_PROJECT_ID .venv/bin/python server.py
+cp .env.example .env.local
+chmod 600 .env.local
 ```
 
-The service listens only on `127.0.0.1:8766`. Replace `YOUR_PROJECT_ID` with **your own** project ID. Google uses your local ADC identity and the explicitly configured project for transcription and quota. No author credentials or account quota are provided.
+Edit `.env.local` and replace `YOUR_PROJECT_ID` with **your own** project ID, then run `.venv/bin/python server.py`. The service listens only on `127.0.0.1:8766`. Google uses your local ADC identity and the explicitly configured project for transcription and quota. No author credentials or account quota are provided.
 
 In Chrome:
 
 1. Open `chrome://extensions` and enable Developer mode.
-2. Choose **Load unpacked** and select only `short-video-demo/extension/`.
+2. Choose **Load unpacked** and select only `app/extension/`.
 3. Open a Japanese YouTube watch or Shorts page and click the extension icon.
 4. Keep the tab open while it records from the beginning to the end at normal speed.
 5. After processing, click sentences to seek. With learning-note generation enabled, Chinese captions and expandable explanations are also available.
@@ -51,19 +52,23 @@ No microphone permission is required. The extension captures digital audio from 
 
 OpenAI processing is **off by default**. Japanese transcription works independently. To enable it, configure your own OpenAI API key on the computer running the backend.
 
-From `short-video-demo/backend/`:
+From `app/backend/`:
 
 ```sh
 .venv/bin/python configure_openai_key.py
 ```
 
-Paste your key at the hidden terminal prompt. The script writes it to `backend/.env.local` with owner-only permissions (`0600`). This local file is ignored by Git. The backend prefers `OPENAI_API_KEY` from its process environment and otherwise reads that local file; you may supply the environment variable through your own secret management instead.
+Paste your key at the hidden terminal prompt. The script updates `OPENAI_API_KEY` in `backend/.env.local` with owner-only permissions (`0600`) and preserves other settings. This local file is ignored by Git. Old one-line key files remain readable and are converted to `KEY=VALUE` when the configuration tool saves them.
 
-Stop the backend, then restart it with learning-note generation enabled:
+Set `ENABLE_ENRICHMENT=1` in `.env.local`, then restart the backend:
 
 ```sh
-GOOGLE_CLOUD_PROJECT=YOUR_PROJECT_ID ENABLE_ENRICHMENT=1 .venv/bin/python server.py
+.venv/bin/python server.py
 ```
+
+All application entry points use the same configuration module: explicit process environment → `app/backend/.env.local` → non-secret defaults. An explicit empty environment value also overrides the file. The loader uses this exact path, never searches parent directories, never executes shell expressions and does not expand `${...}`. Keep `.env.local` outside the extension directory.
+
+The tracked `.env.example` contains only placeholders and non-secret defaults. Keep Google ADC in the Google Cloud CLI's standard local credentials location, outside the repository. Do not put your Google account password, refresh token or credential JSON into `.env.local`. If you use an external service-account file through `GOOGLE_APPLICATION_CREDENTIALS`, configure that environment variable yourself with a path outside the repository; never commit the file.
 
 The current default model is `gpt-6-luna`; set `OPENAI_MODEL` to choose a compatible model available to your own account. If processing fails, the completed transcript and previously saved analysis batches remain available. The UI reports an incomplete analysis rather than discarding the transcript.
 
@@ -71,11 +76,11 @@ Keep keys out of chat messages, extension files, source code and Git. The extens
 
 ## Saved results and reuse
 
-Results are saved under `short-video-demo/data/<job-id>.json`. They include the source video URL, Japanese ASR text, word/sentence timestamps and any generated Chinese translations and analysis. They can reveal your viewing and learning history. Treat this directory as private local data; it is ignored by Git.
+Results are saved under `app/data/<job-id>.json`. They include the source video URL, Japanese ASR text, word/sentence timestamps and any generated Chinese translations and analysis. They can reveal your viewing and learning history. Treat this directory as private local data; it is ignored by Git.
 
 Clicking the extension again on a previously processed video loads the most recent local result instead of recording and billing for the same video again. The panel's **↻** action forces a new recording and transcription. An already-open panel does not automatically refresh after a separate command changes a saved file; click the extension again to reload it.
 
-To add or resume learning notes for a saved transcript without rerecording or calling Google, run from `short-video-demo/backend/`:
+To add or resume learning notes for a saved transcript without rerecording or calling Google, run from `app/backend/`:
 
 ```sh
 .venv/bin/python enrich_cli.py ../data/YOUR_JOB_ID.json
@@ -86,7 +91,7 @@ This command makes OpenAI calls using your own configured key, even though the a
 Local-video transcription is also available from the backend directory:
 
 ```sh
-GOOGLE_CLOUD_PROJECT=YOUR_PROJECT_ID .venv/bin/python cli.py ./video.mov
+.venv/bin/python cli.py ./video.mov
 ```
 
 Replace `./video.mov` with the path to your own media. This CLI produces transcription JSON; there is no separate local-video playback interface in this milestone. Use `enrich_cli.py` afterward for optional learning notes.
@@ -113,14 +118,14 @@ Replace `./video.mov` with the path to your own media. This CLI produces transcr
 
 There is no application-managed Google Cloud Storage bucket. Remote processing and retention are governed by your provider account and its settings. After stopping the service, you can remove unneeded result JSON and any abandoned upload files to reclaim space. Removing a result also removes the corresponding local cache.
 
-The local HTTP service is intended for one user's computer. It checks the loopback Host and allows extension origins or local clients without an Origin header before accessing saved data or starting work. This is not authentication against other programs or extensions on the same computer. Do not expose its port publicly or run it as a shared hosted service. Stop it when you have finished using the demo.
+The local HTTP service is intended for one user's computer. It checks the loopback Host and allows extension origins or local clients without an Origin header before accessing saved data or starting work. This is not authentication against other programs or extensions on the same computer. Do not expose its port publicly or run it as a shared hosted service. Stop it when you have finished using the application.
 
 ## Offline verification
 
 From the repository root, after installing backend dependencies:
 
 ```sh
-cd short-video-demo
+cd app
 backend/.venv/bin/python -m unittest discover -s backend -p 'test_*.py' -v
 ```
 

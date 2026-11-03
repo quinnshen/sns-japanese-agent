@@ -9,6 +9,7 @@ __pycache__/
 # Secrets and cloud account configuration
 .env
 .env.*
+!.env.example
 .config/
 .credentials/
 .aws/
@@ -26,6 +27,10 @@ id_ed25519
 *.p12
 *.pfx
 *.crt
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
 
 # Recordings, transcripts and logs
 data/

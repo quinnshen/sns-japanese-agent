@@ -12,12 +12,20 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch, sentinel
 
+import config
 import enrich
 import pipeline
 import server
 
 
 class CredentialIsolationTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        patcher = patch.object(config, "LOCAL_ENV_FILE", Path(directory.name) / "absent-config")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_missing_or_placeholder_google_project_never_loads_credentials(self):
         for project in (None, "", "   ", "YOUR_PROJECT_ID"):
             environment = {} if project is None else {"GOOGLE_CLOUD_PROJECT": project}
@@ -50,7 +58,7 @@ class CredentialIsolationTests(unittest.TestCase):
     def test_missing_openai_key_never_constructs_a_client(self):
         with tempfile.TemporaryDirectory() as directory, \
                 patch.dict(os.environ, {}, clear=True), \
-                patch.object(enrich, "LOCAL_KEY_FILE", Path(directory) / "missing-local-key"), \
+                patch.object(config, "LOCAL_ENV_FILE", Path(directory) / "missing-local-key"), \
                 patch("openai.OpenAI") as openai_client:
             self.assertIsNone(enrich.local_api_key())
             with self.assertRaisesRegex(RuntimeError, "OpenAI API Key"):
@@ -65,7 +73,7 @@ class CredentialIsolationTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory, \
                 patch.dict(os.environ, {"OPENAI_API_KEY": "operator-key-for-offline-test"}, clear=True), \
-                patch.object(enrich, "LOCAL_KEY_FILE", Path(directory) / "missing-local-key"), \
+                patch.object(config, "LOCAL_ENV_FILE", Path(directory) / "missing-local-key"), \
                 patch("openai.OpenAI") as openai_client:
             openai_client.return_value.responses.create.return_value = response
             items, usage = enrich.openai_enricher("test-model")([], [])

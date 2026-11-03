@@ -4,15 +4,14 @@ from __future__ import annotations
 
 import copy
 import json
-import os
 import re
-from pathlib import Path
 from typing import Callable
+
+from config import setting
 
 BATCH_SIZE = 12
 STYLE_VERSION = 1
 DEFAULT_MODEL = "gpt-6-luna"
-LOCAL_KEY_FILE = Path(__file__).with_name(".env.local")
 
 STUDY_SCHEMA = {
     "type": "object",
@@ -54,12 +53,8 @@ INSTRUCTIONS = """你是日语 SNS 视频台词解析助手。学习者正在学
 
 
 def local_api_key() -> str | None:
-    """Prefer a process env var; otherwise read the private, Git-ignored local key file."""
-    if key := os.getenv("OPENAI_API_KEY"):
-        return key
-    if LOCAL_KEY_FILE.is_file():
-        return LOCAL_KEY_FILE.read_text(encoding="utf-8").strip() or None
-    return None
+    """Use only the operator's process environment or private local settings."""
+    return (setting("OPENAI_API_KEY", "") or "").strip() or None
 
 
 def openai_enricher(model: str) -> Callable:
@@ -189,7 +184,7 @@ def enrich_result(
     progress: Callable | None = None,
 ) -> dict:
     """Enrich only missing or outdated sentences; caller can save after each batch."""
-    model = model or os.getenv("OPENAI_MODEL", DEFAULT_MODEL)
+    model = model or setting("OPENAI_MODEL", DEFAULT_MODEL)
     updated = copy.deepcopy(result)
     sentences = updated.get("sentences", [])
     pending = [

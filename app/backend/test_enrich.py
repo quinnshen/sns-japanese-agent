@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from enrich import BATCH_SIZE, enrich_result, validate_batch
 
@@ -15,6 +16,14 @@ def item(sentence_id, text, meaning="是的。"):
 
 
 class EnrichmentTests(unittest.TestCase):
+    def setUp(self):
+        # Fake enrichers must never read the developer's settings or construct a paid client.
+        for target, replacement in (("enrich.setting", lambda _name, default=None: default),
+                                    ("enrich.local_api_key", lambda: None)):
+            patcher = patch(target, replacement)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def test_one_batch_attaches_translation_and_analysis_without_changing_asr(self):
         original = {"status": "transcribed", "sentences": [
             {"id": "s0001", "text": "そうです。", "start": 1.0},

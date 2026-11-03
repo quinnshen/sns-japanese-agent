@@ -1,20 +1,20 @@
 # SNS Japanese Agent
 
-A personal Japanese video learning prototype for YouTube watch pages and Shorts. This repository contains two independent milestones:
+A Japanese video learning application for YouTube watch pages and Shorts, developed through successive versions. The original five-second integration test is retained separately:
 
 | Milestone | What it does | Local service |
 |---|---|---|
 | [Five-second capture test](#five-second-capture-test) | Capture five seconds of tab audio and obtain Japanese transcription with word timestamps | `127.0.0.1:8765` |
-| [Short-video learning demo](short-video-demo/README.md) | Record a whole video, transcribe it, optionally precompute Chinese translations, sentence explanations and kanji readings, then display the saved results alongside playback | `127.0.0.1:8766` |
+| [Japanese learning application](app/README.md) | Record a whole video, transcribe it, optionally precompute Chinese translations, sentence explanations and kanji readings, then display the saved results alongside playback | `127.0.0.1:8766` |
 
-The short-video demo has been exercised on videos of approximately two minutes. The current 30-minute input limit does **not** mean long-video reliability has been validated.
+The application has been exercised on videos of approximately two minutes. The current 30-minute input limit does **not** mean long-video reliability has been validated.
 
 ## Project layout
 
 ```text
 shorts-audio-capture-test/    Five-second Chrome Manifest V3 extension
 shorts-audio-capture-bridge/  Five-second local Python bridge and offline tests
-short-video-demo/
+app/
   extension/                Whole-video Chrome Manifest V3 extension
   backend/                  Local transcription and optional learning-note service
   README.md                 Setup, workflow, limitations and data retention
@@ -22,12 +22,34 @@ short-video-demo/
 
 Keep Python environments, downloaded SDKs and credentials outside extension directories. Load only the relevant `extension/` or `shorts-audio-capture-test/` directory in Chrome, not the repository root.
 
+## Development and local configuration
+
+Develop and commit directly in this repository. Keep the reusable application in `app/`; version commits by the change they make, such as `feat: ...`, `fix: ...` or `refactor: ...`.
+
+| File / directory | Purpose | Tracked by Git? |
+|---|---|---|
+| `app/backend/.env.example` | Placeholder configuration and public defaults | Yes |
+| `app/backend/.env.local` | Your project ID, API key and local settings | No |
+| `.gitignore` | Excludes local settings, credentials, data and tools | Yes |
+| `.githooks/`, `scripts/` | Commit and push checks for accidental disclosures | Yes |
+| `app/data/` | Private transcripts, source URLs and temporary uploads | No |
+
+Enable local Git checks once per clone:
+
+```sh
+python3 scripts/setup_git_hooks.py
+```
+
+Normal `git add` respects `.gitignore`. The pre-commit check also scans the staged snapshot to reject private configuration files even if force-added, along with recognized secrets and private metadata. The pre-push check checks outgoing commit history, including files deleted in later commits. Checks report paths and rule names, never matched secret values. The scripts can also be run manually; see [development safety](DEVELOPMENT.md).
+
+`.gitignore` does not remove files already tracked by Git. Hooks must be installed on each clone, can be bypassed and cannot detect every possible secret. Keep real credentials in ignored local files from the start; no deletion step is needed before ordinary commits.
+
 ## Your credentials, your billing
 
 The repository provides application code, not access to the author's cloud accounts. There is no hosted transcription endpoint or bundled cloud credential.
 
 - Google transcription requires **your own** Google Cloud project, billing, enabled Speech-to-Text API and Application Default Credentials (ADC). Set `GOOGLE_CLOUD_PROJECT` explicitly; the services use it for the recognizer and quota project. Your authenticated identity must have permission to use that project.
-- The five-second test makes **no OpenAI API calls**. The short-video demo calls OpenAI only when you enable learning-note generation and configure **your own** API key.
+- The five-second test makes **no OpenAI API calls**. The application calls OpenAI only when you enable learning-note generation and configure **your own** API key.
 - Credentials stay in the local backend environment or a local ignored configuration file. The extension does not receive Google credentials or an OpenAI key.
 - Do not commit `.env` files, ADC files, service account keys, local result data, configured Python environments or SDK directories. Keep Google ADC in the normal Google Cloud CLI user configuration location, outside this repository.
 
@@ -74,6 +96,6 @@ cd shorts-audio-capture-bridge
 
 These tests mock Google authentication and transcription, so they do not consume cloud quota.
 
-## Short-video learning demo
+## Japanese learning application
 
-Follow [the short-video setup guide](short-video-demo/README.md). It includes optional OpenAI configuration, recording constraints, local cache behavior and data retention. Both services bind to loopback only and are intended for a personal computer, not public hosting.
+Follow [the short-video setup guide](app/README.md). It includes optional OpenAI configuration, recording constraints, local cache behavior and data retention. Both services bind to loopback only and are intended for a personal computer, not public hosting.

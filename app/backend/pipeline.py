@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import subprocess
 import uuid
 from pathlib import Path
+
+from config import setting
 
 CHUNK_SECONDS = 45.0
 OVERLAP_SECONDS = 2.0
@@ -15,7 +16,7 @@ MAX_DURATION_SECONDS = 30 * 60
 
 
 def ffmpeg_executable() -> str:
-    override = os.getenv("FFMPEG_PATH")
+    override = setting("FFMPEG_PATH")
     if override:
         return override
     import imageio_ffmpeg
@@ -153,7 +154,7 @@ def transcribe_media(
         raise ValueError("录音起点与播放起点的偏移无效。")
 
     if recognize is None:
-        project_id = os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
+        project_id = setting("GOOGLE_CLOUD_PROJECT", "").strip()
         if not project_id or project_id == "YOUR_PROJECT_ID":
             raise RuntimeError("请设置 GOOGLE_CLOUD_PROJECT。")
         from google.auth import default as default_credentials

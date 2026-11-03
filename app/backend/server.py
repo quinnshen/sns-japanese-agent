@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import threading
 import uuid
@@ -11,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from config import setting
 from pipeline import MAX_DURATION_SECONDS, save_result, transcribe_media
 from enrich import enrich_result, local_api_key
 
@@ -75,7 +75,7 @@ def run_job(job_id: str, path: Path, duration: float, offset: float, url: str) -
         )
         result["id"] = job_id
         save_result(result, DATA_DIR)
-        if os.getenv("ENABLE_ENRICHMENT") == "1":
+        if setting("ENABLE_ENRICHMENT") == "1":
             with jobs_lock:
                 jobs[job_id].update(status="enriching", enrichment_batches_done=0, enrichment_batches_total=0)
             try:
@@ -102,6 +102,10 @@ def run_job(job_id: str, path: Path, duration: float, offset: float, url: str) -
 
 
 class Handler(BaseHTTPRequestHandler):
+    def log_request(self, code="-", size="-") -> None:
+        # The default HTTP access log includes source video URLs in query strings.
+        self.log_message("%s %s %s", self.command, urlparse(self.path).path, str(code))
+
     def reject_untrusted_request(self) -> bool:
         if not trusted_request_source(self.headers.get("Host", ""), self.headers.get("Origin", "")):
             self.send_json(403, {"error": "Local extension requests only"})
@@ -143,8 +147,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self.send_json(200, {
                 "ok": True,
-                "project_configured": bool(os.getenv("GOOGLE_CLOUD_PROJECT")),
-                "enrichment_enabled": os.getenv("ENABLE_ENRICHMENT") == "1",
+                "project_configured": bool(setting("GOOGLE_CLOUD_PROJECT")),
+                "enrichment_enabled": setting("ENABLE_ENRICHMENT") == "1",
                 "enrichment_key_configured": bool(local_api_key()),
             })
             return
@@ -225,6 +229,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    configured = bool(os.getenv("GOOGLE_CLOUD_PROJECT", "").strip())
+    configured = bool(setting("GOOGLE_CLOUD_PROJECT", "").strip())
     print(f"Listening on http://{HOST}:{PORT}; Google project configured: {configured}")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
