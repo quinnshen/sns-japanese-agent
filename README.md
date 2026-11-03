@@ -1,36 +1,41 @@
 # SNS Japanese Agent
 
-This first milestone tests one small part of a Japanese video learning agent: capture **five seconds** of a playing YouTube tab and obtain Japanese transcription with word timestamps.
+A personal Japanese video learning prototype for YouTube watch pages and Shorts. This repository contains two independent milestones:
 
-## Current scope
+| Milestone | What it does | Local service |
+|---|---|---|
+| [Five-second capture test](#five-second-capture-test) | Capture five seconds of tab audio and obtain Japanese transcription with word timestamps | `127.0.0.1:8765` |
+| [Short-video learning demo](short-video-demo/README.md) | Record a whole video, transcribe it, optionally precompute Chinese translations, sentence explanations and kanji readings, then display the saved results alongside playback | `127.0.0.1:8766` |
 
-1. Click the Chrome extension on a YouTube watch or Shorts page.
-2. Record five seconds of tab audio in memory and display its byte count, peak RMS and audio track count.
-3. Send the recording to a bridge on `127.0.0.1:8765`.
-4. The bridge calls Google Speech-to-Text V2 with `ja-JP`, automatic punctuation and word timestamps.
-
-Timestamps are relative to the recording start. This milestone does not download videos, identify speakers, translate, or generate grammar explanations. It makes **no OpenAI API calls**. Recordings are not written to disk by the application.
+The short-video demo has been exercised on videos of approximately two minutes. The current 30-minute input limit does **not** mean long-video reliability has been validated.
 
 ## Project layout
 
 ```text
-shorts-audio-capture-test/    Chrome Manifest V3 extension
-shorts-audio-capture-bridge/  Local Python bridge and offline tests
+shorts-audio-capture-test/    Five-second Chrome Manifest V3 extension
+shorts-audio-capture-bridge/  Five-second local Python bridge and offline tests
+short-video-demo/
+  extension/                Whole-video Chrome Manifest V3 extension
+  backend/                  Local transcription and optional learning-note service
+  README.md                 Setup, workflow, limitations and data retention
 ```
 
-Keep the bridge and its Python environment outside the extension directory. Chrome scans the unpacked extension directory, so it should contain only the four extension files.
+Keep Python environments, downloaded SDKs and credentials outside extension directories. Load only the relevant `extension/` or `shorts-audio-capture-test/` directory in Chrome, not the repository root.
 
-## Credentials and billing
+## Your credentials, your billing
 
-This repository contains no API keys, Google account credentials, service account files, author project IDs, or hosted transcription endpoint. Cloning it grants no access to the author's Google Cloud or OpenAI accounts.
+The repository provides application code, not access to the author's cloud accounts. There is no hosted transcription endpoint or bundled cloud credential.
 
-Google transcription requires **your own** Google Cloud project, enabled billing, Speech-to-Text API access and Application Default Credentials (ADC) on the computer running the bridge. You must explicitly set `GOOGLE_CLOUD_PROJECT`; there is no project fallback. The bridge uses that project for both its recognizer resource and quota project. Your authenticated identity must have permission to use that project. See Google's [quota project documentation](https://docs.cloud.google.com/docs/quotas/set-quota-project).
+- Google transcription requires **your own** Google Cloud project, billing, enabled Speech-to-Text API and Application Default Credentials (ADC). Set `GOOGLE_CLOUD_PROJECT` explicitly; the services use it for the recognizer and quota project. Your authenticated identity must have permission to use that project.
+- The five-second test makes **no OpenAI API calls**. The short-video demo calls OpenAI only when you enable learning-note generation and configure **your own** API key.
+- Credentials stay in the local backend environment or a local ignored configuration file. The extension does not receive Google credentials or an OpenAI key.
+- Do not commit `.env` files, ADC files, service account keys, local result data, configured Python environments or SDK directories. Keep Google ADC in the normal Google Cloud CLI user configuration location, outside this repository.
 
-Without your own project and credentials, local audio capture can still work, but cloud transcription cannot. No OpenAI key is needed for this milestone. Keep ADC files in the normal Google Cloud CLI user configuration location, outside this repository. Never copy a configured Python environment, SDK directory, `.env` file, key file, or cloud account configuration into the extension or repository.
+Cloud usage is billed to the accounts you configure. See Google's [quota project documentation](https://docs.cloud.google.com/docs/quotas/set-quota-project).
 
-## Setup
+## Common prerequisites
 
-Requires Chrome 116+, Python 3.11+ and the [Google Cloud CLI](https://cloud.google.com/sdk/docs/install).
+Use Chrome 116+, Python 3.11+ and the [Google Cloud CLI](https://cloud.google.com/sdk/docs/install).
 
 Create or select your own Google Cloud project, enable billing and the [Speech-to-Text API](https://console.cloud.google.com/apis/library/speech.googleapis.com), then configure [local ADC](https://docs.cloud.google.com/docs/authentication/set-up-adc-local-dev-environment):
 
@@ -39,9 +44,11 @@ gcloud auth application-default login --scopes=https://www.googleapis.com/auth/c
 gcloud auth application-default set-quota-project YOUR_PROJECT_ID
 ```
 
-Replace `YOUR_PROJECT_ID` with your own project ID in both commands below and above.
+Replace `YOUR_PROJECT_ID` with your own project ID in every command. These credentials authenticate the computer running the backend; they are not supplied by this repository.
 
-From the repository root, start the local bridge:
+## Five-second capture test
+
+From the repository root:
 
 ```sh
 cd shorts-audio-capture-bridge
@@ -50,23 +57,23 @@ python3.11 -m venv .venv
 GOOGLE_CLOUD_PROJECT=YOUR_PROJECT_ID .venv/bin/python transcribe_server.py
 ```
 
-In Chrome, open `chrome://extensions`, enable Developer mode and choose **Load unpacked**. Select only `shorts-audio-capture-test/`. Open a YouTube video or Short, start playback and click the extension while Japanese speech is playing. The on-page result appears after recording and transcription.
+In Chrome, open `chrome://extensions`, enable Developer mode and choose **Load unpacked**. Select only `shorts-audio-capture-test/`. Open a YouTube video or Short, start playback and click the extension while Japanese speech is playing.
 
-The bridge binds only to `127.0.0.1`. It is intended for a personal computer, not public hosting. Stop it when the test is complete. If it is not running, the extension still reports capture measurements and shows a connection error for transcription.
+The extension captures five seconds of the tab's audio, displays the byte count, peak RMS and audio track count, and sends it to the local bridge. Google Speech-to-Text V2 returns Japanese text and word timestamps relative to the recording start. The application does not write these recordings to disk.
 
-## Extension permissions
+This test does not download videos, identify speakers, translate or generate grammar explanations. If the bridge is not running, the extension can still report capture measurements but transcription shows a connection error.
 
-- `activeTab`: operate on the tab where you click the extension.
-- `tabCapture`: capture that tab's audio, not the microphone.
-- `offscreen`: record five seconds without keeping a popup open.
-- `scripting`: display status and results on the current page.
-- `http://127.0.0.1:8765/*`: send audio to your local bridge.
+Its permissions are `activeTab` (the clicked tab), `tabCapture` (tab audio, not the microphone), `offscreen` (background recording), `scripting` (on-page results), and access to `http://127.0.0.1:8765/*` (the local bridge).
 
-## Offline checks
-
-These tests mock authentication and Speech-to-Text. They do not contact Google or consume cloud quota.
+Run its offline tests from the repository root:
 
 ```sh
 cd shorts-audio-capture-bridge
 .venv/bin/python -m unittest discover -p 'test_*.py' -v
 ```
+
+These tests mock Google authentication and transcription, so they do not consume cloud quota.
+
+## Short-video learning demo
+
+Follow [the short-video setup guide](short-video-demo/README.md). It includes optional OpenAI configuration, recording constraints, local cache behavior and data retention. Both services bind to loopback only and are intended for a personal computer, not public hosting.
