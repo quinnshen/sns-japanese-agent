@@ -1,5 +1,5 @@
 (() => {
-  const PAGE_VERSION = "0.4.3";
+  const PAGE_VERSION = "0.5.2";
   const PAGE_PROTOCOL = 1;
   const previous = window.__snsJapaneseAgentPage;
   if (previous) {
@@ -42,6 +42,16 @@
   let transcriptionEpoch = 0;
   let transcriptionCaptureId;
   let contextInvalidated = false;
+  let enrichmentEnabled = false;
+  let learningTimer;
+  let learningInFlight = false;
+  let learningEpoch = 0;
+  let learningCaptureId;
+  let learningRevision = "";
+  let learningSourceIdentity = "";
+  let captureFormAutoCollapsed = false;
+  let captureFormUserOpened = false;
+  const openAnalyses = new Set();
 
   const host = document.createElement("div");
   host.id = rootId;
@@ -50,17 +60,27 @@
   style.textContent = `
     :host { all: initial; }
     .panel { position: fixed; top: 16px; right: 16px; z-index: 2147483647;
-      width: min(390px, calc(100vw - 32px)); max-height: min(78vh, 800px);
+      width: min(390px, calc(100vw - 32px)); height: min(84vh, 820px);
+      height: min(84dvh, 820px); max-height: calc(100dvh - 32px); overflow: hidden;
       display: flex; flex-direction: column; background: #f8faf8; color: #21382d;
       border: 1px solid #d8e3da; border-radius: 14px; box-shadow: 0 12px 36px #0005;
       font: 14px/1.55 -apple-system, BlinkMacSystemFont, sans-serif; }
-    .head { padding: 13px 15px; border-bottom: 1px solid #dbe7df; display: flex; gap: 10px; align-items: start; }
+    .head { flex: 0 0 auto; padding: 13px 15px; border-bottom: 1px solid #dbe7df; display: flex; gap: 10px; align-items: start; }
     .title { font-size: 15px; font-weight: 700; flex: 1; }
     .close { cursor: pointer; border: 0; background: transparent; font-size: 18px; color: #647a6d; }
     button:disabled { opacity: .5; cursor: default !important; }
-    .status { padding: 10px 15px; color: #4a6554; white-space: pre-wrap; }
+    .status { padding: 0 0 6px; color: #4a6554; white-space: pre-wrap; }
     .status.error { color: #b42318; }
-    .list { overflow: auto; padding: 0 8px 8px; }
+    .capture-options { flex: 0 1 auto; min-height: 36px; overflow: hidden; border-bottom: 1px solid #dbe7df; }
+    .capture-options[open] { max-height: 42%; overflow-y: auto; }
+    .capture-summary { position: sticky; top: 0; z-index: 1; padding: 7px 15px; background: #f8faf8; color: #4a6554; cursor: pointer; font-size: 12px; }
+    .learning-toolbar { flex: 0 0 auto; padding: 7px 12px; display: grid; gap: 5px; border-bottom: 1px solid #dbe7df; }
+    .learning-status { max-height: 4.5em; overflow-y: auto; }
+    .alignment-note { font-size: 11px; color: #798f80; }
+    .toolbar-actions { display: flex; gap: 6px; align-items: center; justify-content: space-between; }
+    .toolbar-actions button { min-width: 0; padding: 4px 7px !important; font-size: 12px; }
+    .list { flex: 1 1 0; min-height: 0; overflow-y: auto; padding: 0 8px 8px; }
+    @media (max-height: 420px) { .head { padding: 8px 12px; } .learning-status { max-height: 2.5em; } .capture-options[open] { max-height: 35%; } }
     .row { display: block; width: 100%; text-align: left; padding: 10px 9px; margin: 3px 0;
       border: 0; border-radius: 8px; background: transparent; color: #21382d;
       cursor: pointer; font: inherit; }
@@ -91,7 +111,7 @@
   head.className = "head";
   const title = document.createElement("div");
   title.className = "title";
-  title.textContent = "日语视频 · 音频采集";
+  title.textContent = "日语视频 · 学习";
   const version = document.createElement("span");
   version.className = "version";
   version.style.cssText = "font-size:11px;color:#647a6d";
@@ -103,6 +123,8 @@
   close.title = "关闭面板";
   close.addEventListener("click", () => {
     stopTranscriptionPolling();
+    stopLearningPolling();
+    suspendLearningDisplay();
     if (configured || busy || recording) report("capture-cancel");
     host.style.display = "none";
     subtitle.textContent = "";
@@ -112,8 +134,18 @@
   status.className = "status";
   const list = document.createElement("div");
   list.className = "list";
+  const captureForm = document.createElement("details");
+  captureForm.className = "capture-options";
+  captureForm.open = true;
+  const captureSummary = document.createElement("summary");
+  captureSummary.className = "capture-summary";
+  captureSummary.textContent = "采集设置与回放";
+  const rememberFormOpen = () => { if (!captureForm.open) captureFormUserOpened = true; };
+  captureSummary.addEventListener("click", rememberFormOpen);
+  captureSummary.addEventListener("keydown", (event) => { if (["Enter", " "].includes(event.key)) rememberFormOpen(); });
   const controls = document.createElement("div");
   controls.style.cssText = "padding:0 15px 12px;display:grid;gap:8px";
+  controls.append(status);
   function field(labelText, value) {
     const label = document.createElement("label");
     label.textContent = labelText;
@@ -141,7 +173,7 @@
   cancel.textContent = "中断／释放音频";
   cancel.disabled = true;
   for (const button of [begin, cancel]) button.style.cssText = "padding:6px 10px;border:1px solid #bdcec1;border-radius:6px;background:white;color:#355944;cursor:pointer;font:inherit";
-  buttons.append(begin, cancel);
+  buttons.append(begin);
   controls.append(buttons);
   const metrics = document.createElement("div");
   metrics.style.cssText = "font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere";
@@ -151,8 +183,29 @@
   transcriptionStatus.className = "transcription-status";
   transcriptionStatus.style.cssText = "font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere";
   transcriptionStatus.hidden = true;
+  const learningStatus = document.createElement("div");
+  learningStatus.className = "learning-status";
+  learningStatus.style.cssText = "font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere";
+  learningStatus.hidden = true;
+  const loadLearning = document.createElement("button");
+  loadLearning.type = "button";
+  loadLearning.textContent = "读取已保存学习内容";
+  loadLearning.style.cssText = cancel.style.cssText;
+  loadLearning.title = "仅查询本机，不会开始录音或发起云端处理";
+  loadLearning.addEventListener("click", () => { if (extensionContextIsValid()) startLearningPolling(); });
   controls.append(metrics, transcriptionStatus, replay);
-  panel.append(head, status, controls, list);
+  captureForm.append(captureSummary, controls);
+  const learningToolbar = document.createElement("div");
+  learningToolbar.className = "learning-toolbar";
+  const alignmentNote = document.createElement("div");
+  alignmentNote.className = "alignment-note";
+  alignmentNote.textContent = "字幕时间由播放记录估算。";
+  alignmentNote.hidden = true;
+  const toolbarActions = document.createElement("div");
+  toolbarActions.className = "toolbar-actions";
+  toolbarActions.append(loadLearning, cancel);
+  learningToolbar.append(learningStatus, alignmentNote, toolbarActions);
+  panel.append(head, captureForm, learningToolbar, list);
   begin.addEventListener("click", () => {
     if (busy || !configured || !extensionContextIsValid()) return;
     try {
@@ -180,6 +233,8 @@
   });
   cancel.addEventListener("click", () => {
     stopTranscriptionPolling();
+    stopLearningPolling();
+    suspendLearningDisplay();
     cancelPreparation();
     cancel.disabled = true;
     report("capture-cancel");
@@ -198,28 +253,35 @@
     host.style.display = "";
     status.textContent = text;
     status.classList.toggle("error", error);
+    if (error) captureForm.open = true;
   }
 
   function invalidateContext() {
     if (contextInvalidated) return;
     contextInvalidated = true;
     stopTranscriptionPolling();
+    stopLearningPolling();
     cancelPreparation();
     stopPlayback();
     video?.removeEventListener("timeupdate", updateSubtitle);
     configured = false;
     busy = false;
     transcriptionEnabled = false;
+    enrichmentEnabled = false;
     begin.disabled = true;
     cancel.disabled = true;
     setInputsDisabled(true);
     transcriptionStatus.hidden = true;
+    learningStatus.hidden = true;
+    alignmentNote.hidden = true;
+    loadLearning.disabled = true;
     replay.replaceChildren();
     list.replaceChildren();
     subtitle.textContent = "";
     host.style.display = "";
     status.textContent = "扩展已更新或停用。请刷新当前 YouTube 页面，再点击 SNS 扩展图标。本机已确认保存的数据仍保留；正在采集的任务请检查本机状态。";
     status.classList.toggle("error", true);
+    captureForm.open = true;
   }
 
   function extensionContextIsValid() {
@@ -278,7 +340,8 @@
         const count = (number) => Number.isSafeInteger(number) && number >= 0 ? number : 0;
         const done = count(value.windows_done), total = count(value.windows_total), sentences = count(value.sentences);
         if (value.status === "complete") {
-          transcriptionStatus.textContent = `Google 日语转写完成：${done}/${total} 个窗口，已整理 ${sentences} 句。翻译和假名解析尚未处理。`;
+          transcriptionStatus.textContent = `Google 日语转写完成：${done}/${total} 个窗口，已整理 ${sentences} 句。` +
+            (enrichmentEnabled ? "翻译和解析进度见下方。" : "翻译和假名解析尚未处理。");
           terminal = true;
         } else if (value.status === "needs_attention" || value.status === "request_budget_reached") {
           transcriptionStatus.textContent = `Google 日语转写需检查：${done}/${total} 个窗口，已整理 ${sentences} 句。` +
@@ -298,6 +361,119 @@
         if (current()) {
           if (terminal) stopTranscriptionPolling();
           else schedule();
+        }
+      }
+    };
+    void poll();
+  }
+
+  function stopLearningPolling() {
+    clearTimeout(learningTimer);
+    learningTimer = undefined;
+    learningCaptureId = undefined;
+    learningEpoch++;
+  }
+
+  function suspendLearningDisplay() {
+    video?.removeEventListener("timeupdate", updateSubtitle);
+    subtitle.textContent = "";
+  }
+
+  function clearLearningDisplay() {
+    suspendLearningDisplay();
+    sentences = [];
+    rows = [];
+    openAnalyses.clear();
+    list.replaceChildren();
+    activeId = "";
+    learningRevision = "";
+    alignmentNote.hidden = true;
+    if (!busy && !recording) { captureForm.open = true; captureFormAutoCollapsed = false; }
+  }
+
+  function startLearningPolling(captureId) {
+    if (contextInvalidated) return;
+    if (captureId && captureId === learningCaptureId) return;
+    const previousCaptureId = learningCaptureId;
+    if (captureId && captureId !== learningCaptureId) clearLearningDisplay();
+    stopLearningPolling();
+    learningCaptureId = captureId;
+    learningSourceIdentity = identity();
+    const expectedSource = learningSourceIdentity;
+    const epoch = learningEpoch;
+    let disabledPolls = 0;
+    let attentionSnapshot = "";
+    let attentionObservations = 0;
+    learningStatus.hidden = false;
+    learningStatus.textContent = captureId ? "翻译和解析：等待完整句子就绪…" : "正在读取本机已保存的学习内容…";
+    const current = () => !contextInvalidated && learningEpoch === epoch && identity() === expectedSource;
+    const schedule = () => { if (current()) learningTimer = setTimeout(() => { void poll(); }, 2500); };
+    const poll = async () => {
+      if (!current()) return;
+      if (learningInFlight) { schedule(); return; }
+      learningInFlight = true;
+      loadLearning.disabled = true;
+      let terminal = false;
+      try {
+        const reply = await sendToWorker({ target: "worker", type: learningCaptureId ? "capture-learning-status" : "capture-learning-load",
+          ...(learningCaptureId ? { captureId: learningCaptureId } : {}) });
+        if (!current()) return;
+        if (!reply?.ok || !reply.learning) throw new Error("Learning unavailable");
+        const value = reply.learning;
+        if (value.capture_id) {
+          if (!captureId && previousCaptureId && value.capture_id !== previousCaptureId) clearLearningDisplay();
+          learningCaptureId = value.capture_id;
+        }
+        const count = (item) => Number.isSafeInteger(item) && item >= 0 ? item : 0;
+        const done = count(value.sentences_done), total = count(value.sentences_total);
+        if (value.status !== "needs_attention") { attentionSnapshot = ""; attentionObservations = 0; }
+        const ready = Array.isArray(value.result?.sentences) ? value.result.sentences : [];
+        const revision = JSON.stringify([learningCaptureId, value.revision, ready]);
+        if (revision !== learningRevision && ready.length) {
+          renderResult(value.result, false);
+          learningRevision = revision;
+        }
+        if (value.status === "not_found") {
+          clearLearningDisplay();
+          learningStatus.textContent = "本机还没有这个视频的学习内容。查询未开始录音，也未调用云端。";
+          terminal = true;
+        } else if (value.status === "complete") {
+          learningStatus.textContent = `翻译和解析完成：${done}/${total} 句。点击解析展示已保存内容。`;
+          terminal = true;
+        } else if (value.status === "needs_attention") {
+          learningStatus.textContent = `翻译和解析需检查：已完成 ${done}/${total} 句；已有内容可继续学习。不会自动重试未知或失败请求。`;
+          terminal = true;
+          if (enrichmentEnabled && count(value.batches_done) + count(value.blocked_batches) < count(value.batches_total)) {
+            const snapshot = JSON.stringify([value.revision, done, total, count(value.batches_done), count(value.batches_total), count(value.blocked_batches)]);
+            attentionObservations = snapshot === attentionSnapshot ? attentionObservations + 1 : 1;
+            attentionSnapshot = snapshot;
+            terminal = attentionObservations >= 2;
+            if (!terminal) learningStatus.textContent += " 其余批次尚未完成，正在确认进度。";
+          }
+        } else if (["error", "paused", "disabled", "request_budget_reached"].includes(value.status)) {
+          learningStatus.textContent = `翻译和解析需检查：已完成 ${done}/${total} 句；已有内容可继续学习。不会自动重试未知或失败请求。`;
+          terminal = true;
+        } else {
+          learningStatus.textContent = `翻译和解析：已完成 ${done}/${total} 句，${count(value.batches_done)}/${count(value.batches_total)} 批；已有内容可直接展开。`;
+        }
+        if (!enrichmentEnabled && !terminal) {
+          if (value.status === "not_started") {
+            learningStatus.textContent = "本机尚未预生成翻译和解析；自动处理未启用。读取已有内容不会发起云端处理。";
+            terminal = true;
+          } else if (++disabledPolls >= 12) {
+            learningStatus.textContent += " 自动处理已关闭，已停止查询；稍后可点击读取已保存学习内容。";
+            terminal = true;
+          }
+        }
+        if (value.invalid_sentences) learningStatus.textContent += ` ${count(value.invalid_sentences)} 句未通过校验，未展示。`;
+      } catch (_) {
+        if (current()) learningStatus.textContent = "无法读取本机学习内容。查询不会触发云端处理，请检查本机任务。";
+        terminal = true;
+      } finally {
+        learningInFlight = false;
+        if (current()) {
+          loadLearning.disabled = false;
+          if (!terminal) schedule();
         }
       }
     };
@@ -367,10 +543,20 @@
   }
 
   function configuring(message) {
+    if (message.sessionId !== sessionId) {
+      captureFormAutoCollapsed = false;
+      captureFormUserOpened = false;
+      captureForm.open = true;
+    }
     stopTranscriptionPolling();
+    stopLearningPolling();
+    clearLearningDisplay();
+    enrichmentEnabled = message.enrichmentEnabled === true;
+    learningStatus.hidden = true;
     transcriptionEnabled = message.transcriptionEnabled === true;
     transcriptionStatus.hidden = !transcriptionEnabled;
-    transcriptionStatus.textContent = transcriptionEnabled ? "开始采集后将自动分批发送 Google 转写；不调用 GPT。" : "";
+    transcriptionStatus.textContent = enrichmentEnabled ? "开始采集后将自动分批发送 Google 转写，并调用 GPT 预生成翻译和解析。" :
+      transcriptionEnabled ? "开始采集后将自动分批发送 Google 转写；不调用 GPT。" : "";
     cancelPreparation();
     cleanupPlayback();
     sessionId = message.sessionId;
@@ -442,6 +628,7 @@
     list.replaceChildren();
     subtitle.textContent = "";
     host.style.display = "";
+    startLearningPolling();
     return { ok: true };
   }
 
@@ -509,6 +696,8 @@
     });
     recording = true;
     startTranscriptionPolling(sessionId);
+    if (enrichmentEnabled) startLearningPolling(sessionId);
+    updateSeekAvailability();
     if (contextInvalidated) throw new Error("Extension context invalidated.");
     playbackStarted = false;
     playbackStartedAt = 0;
@@ -540,6 +729,7 @@
       }
       const failure = { code, message, at_ms: Date.now(), ...observed };
       stopTranscriptionPolling();
+      stopLearningPolling();
       recording = false;
       rejectPlaying(new Error(message));
       cleanupPlayback();
@@ -646,6 +836,7 @@
     if (recording || busy) video?.pause();
     if (video) video.loop = originalLoop;
     recording = false;
+    updateSeekAvailability();
   }
 
   function showProgress(value) {
@@ -673,22 +864,77 @@
     replay.append(label, open, note);
   }
 
-  function updateSubtitle() {
-    if (!video || !sentences.length) return;
-    const time = video.currentTime;
-    const active = sentences.find((item) => item.start <= time && time <= item.end + 0.25);
-    if (active?.id === activeId) return;
-    activeId = active?.id || "";
-    subtitle.textContent = active ? [active.study?.reading_text || active.text, active.translation_zh].filter(Boolean).join("\n") : "";
-    rows.forEach((row) => row.classList.toggle("active", row.dataset.id === activeId));
+  function mappedSentence(sentence) {
+    return typeof sentence.start === "number" && Number.isFinite(sentence.start) && sentence.start >= 0 &&
+      typeof sentence.end === "number" && Number.isFinite(sentence.end) && sentence.end >= sentence.start;
   }
 
-  function renderResult(result) {
+  function readingPreservesSource(source, reading) {
+    let positions = new Set([0]);
+    let previous = "";
+    const han = (value) => /[㐀-䶿一-鿿豈-﫿々〆ヶ\u{20000}-\u{2EBEF}]/u.test(value || "");
+    for (const character of source) {
+      const next = new Set();
+      for (const position of positions) {
+        const candidates = [position];
+        const annotation = han(previous) && /^\([ぁ-ゖァ-ヺーゝゞヽヾ]+\)/u.exec(reading.slice(position));
+        if (annotation) candidates.push(position + annotation[0].length);
+        for (const candidate of candidates) if (reading.startsWith(character, candidate)) next.add(candidate + character.length);
+      }
+      positions = next;
+      previous = character;
+      if (!positions.size) return false;
+    }
+    return [...positions].some((position) => position === reading.length ||
+      (han(previous) && /^\([ぁ-ゖァ-ヺーゝゞヽヾ]+\)$/u.test(reading.slice(position))));
+  }
+
+  function safeDisplayReading(sentence) {
+    const reading = sentence.study?.style_version === 2 && sentence.study?.reading_text;
+    if (typeof reading === "string" && reading && !/[㐀-䶿一-鿿豈-﫿々〆ヶ\u{20000}-\u{2EBEF}]/u.test(
+      reading.replace(/[㐀-䶿一-鿿豈-﫿々〆ヶ\u{20000}-\u{2EBEF}]+\([ぁ-ゖァ-ヺーゝゞヽヾ]+\)/gu, "")) &&
+      typeof sentence.translation_zh === "string" && sentence.translation_zh && Array.isArray(sentence.study.key_points) &&
+      (typeof sentence.text !== "string" || readingPreservesSource(sentence.text, reading))) return reading;
+    if (sentence.study?.style_version === 2) return "";
+    // Legacy kana-only lines are readable without annotations. Never fall back to raw kanji.
+    return typeof sentence.text === "string" && !/[㐀-䶿一-鿿豈-﫿々〆ヶ\u{20000}-\u{2EBEF}]/u.test(sentence.text) ? sentence.text : "";
+  }
+
+  function updateSeekAvailability() {
+    for (const row of rows) {
+      row.button.disabled = recording || !mappedSentence(row.sentence);
+      row.button.title = !mappedSentence(row.sentence) ? "时间待确认，无法跳转" : recording ? "采集期间不能跳转；解析仍可展开" : "跳转播放这一句";
+    }
+  }
+
+  function updateSubtitle() {
+    if (!video || !sentences.length || identity() !== learningSourceIdentity) {
+      subtitle.textContent = "";
+      return;
+    }
+    const time = video.currentTime;
+    const active = sentences.find((item) => mappedSentence(item) && item.start <= time && time <= item.end + 0.25);
+    if (active?.id === activeId) return;
+    activeId = active?.id || "";
+    subtitle.textContent = active ? [active.displayReading, active.translation_zh].filter(Boolean).join("\n") : "";
+    rows.forEach((row) => row.element.classList.toggle("active", row.sentence.id === activeId));
+    if (active && !openAnalyses.size) rows.find((row) => row.sentence.id === activeId)?.element.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
+  }
+
+  function renderResult(result, showSummary = true) {
     video?.removeEventListener("timeupdate", updateSubtitle);
     video = findVideo();
-    sentences = result.sentences || [];
+    learningSourceIdentity = identity();
+    sentences = (Array.isArray(result?.sentences) ? result.sentences : [])
+      .filter((item) => item && typeof item.id === "string")
+      .map((item) => ({ ...item, displayReading: safeDisplayReading(item) }))
+      .filter((item) => item.displayReading);
+    alignmentNote.hidden = !sentences.some((item) => mappedSentence(item) && item.mapping_uncertain === true);
     rows = [];
+    const scrollTop = list.scrollTop;
     list.replaceChildren();
+    const visibleIds = new Set(sentences.map((item) => item.id));
+    for (const id of openAnalyses) if (!visibleIds.has(id)) openAnalyses.delete(id);
     for (const sentence of sentences) {
       const entry = document.createElement("div");
       entry.className = "entry";
@@ -699,9 +945,11 @@
       row.dataset.id = sentence.id;
       const time = document.createElement("span");
       time.className = "time";
-      time.textContent = `${formatPreciseTime(sentence.start)}–${formatPreciseTime(sentence.end)}`;
+      time.textContent = mappedSentence(sentence)
+        ? `${formatPreciseTime(sentence.start)}–${formatPreciseTime(sentence.end)}`
+        : "时间待确认";
       const text = document.createElement("span");
-      text.textContent = sentence.study?.reading_text || sentence.text;
+      text.textContent = sentence.displayReading;
       row.append(time, text);
       if (sentence.translation_zh) {
         const translation = document.createElement("span");
@@ -710,65 +958,77 @@
         row.append(translation);
       }
       row.addEventListener("click", () => {
-        if (!video) return;
+        if (!video || recording || !mappedSentence(sentence)) return;
         video.currentTime = sentence.start;
-        void video.play();
+        void Promise.resolve(video.play()).catch(() => showStatus("请点击视频播放器继续播放。", true));
         updateSubtitle();
       });
       entry.append(row);
-      if (sentence.study) {
+      const study = sentence.study?.style_version === 2 ? sentence.study : null;
+      if (study) {
         const toggle = document.createElement("button");
         toggle.type = "button";
         toggle.className = "analyze";
-        toggle.textContent = "解析";
-        toggle.setAttribute("aria-expanded", "false");
         const detail = document.createElement("div");
         detail.className = "study";
-        detail.hidden = true;
+        const expanded = openAnalyses.has(sentence.id);
+        detail.hidden = !expanded;
+        toggle.textContent = expanded ? "收起解析" : "解析";
+        toggle.setAttribute("aria-expanded", String(expanded));
         const original = document.createElement("p");
-        original.textContent = `原句：${sentence.study.reading_text || sentence.text}`;
+        original.textContent = `原句：${sentence.displayReading}`;
         const meaning = document.createElement("p");
         meaning.textContent = `意思：${sentence.translation_zh || "未生成"}`;
         detail.append(original, meaning);
-        if (sentence.study.key_points?.length) {
+        if (Array.isArray(study.key_points) && study.key_points.length) {
           const label = document.createElement("p");
           label.textContent = "关键拆解：";
           const points = document.createElement("ul");
-          for (const point of sentence.study.key_points) {
+          for (const point of study.key_points) {
             const item = document.createElement("li");
             item.textContent = point;
             points.append(item);
           }
           detail.append(label, points);
         }
-        if (sentence.study.context_note) {
+        if (study.context_note) {
           const note = document.createElement("p");
-          note.textContent = `语境待确认：${sentence.study.context_note}`;
+          note.textContent = `语境待确认：${study.context_note}`;
           detail.append(note);
         }
-        if (sentence.study.asr_doubt) {
+        if (!mappedSentence(sentence)) {
+          const note = document.createElement("p");
+          note.textContent = "视频时间待确认；可以学习本句，暂不提供跳转。";
+          detail.append(note);
+        }
+        if (study.asr_doubt) {
           const doubt = document.createElement("p");
-          doubt.textContent = `ASR 存疑：${sentence.study.asr_doubt}`;
+          doubt.textContent = `ASR 存疑：${study.asr_doubt}`;
           detail.append(doubt);
         }
         toggle.addEventListener("click", () => {
           detail.hidden = !detail.hidden;
+          if (detail.hidden) openAnalyses.delete(sentence.id); else openAnalyses.add(sentence.id);
           toggle.setAttribute("aria-expanded", String(!detail.hidden));
           toggle.textContent = detail.hidden ? "解析" : "收起解析";
         });
         entry.append(toggle, detail);
       }
       list.append(entry);
-      rows.push(entry);
+      rows.push({ element: entry, button: row, sentence });
     }
+    list.scrollTop = scrollTop;
+    updateSeekAvailability();
     video?.addEventListener("timeupdate", updateSubtitle);
     activeId = "";
     updateSubtitle();
-    const translated = sentences.filter((item) => item.translation_zh).length;
-    const analyzed = sentences.filter((item) => item.study).length;
-    showStatus(sentences.length
-      ? `共 ${sentences.length} 句${translated ? `，已翻译 ${translated} 句` : ""}${analyzed ? `，已解析 ${analyzed} 句` : ""}；点击句子跳转，点击解析展开。`
-      : "转写完成，但没有识别出日语语音。");
+    if (sentences.length && !captureFormAutoCollapsed && !captureFormUserOpened && !status.classList.contains("error")) {
+      captureForm.open = false;
+      captureFormAutoCollapsed = true;
+    }
+    if (showSummary) showStatus(sentences.length
+      ? `已保存 ${sentences.length} 句学习内容；点击句子跳转，点击解析展开。`
+      : "尚无通过假名标注校验的学习内容。原始转写保存在本机。");
   }
 
   chrome.runtime.onMessage.addListener((message, sender, respond) => {
@@ -787,6 +1047,7 @@
       sendResponse({ ok: true });
     } else if (message.type === "capture-show") {
       host.style.display = "";
+      if (sentences.length) { video?.addEventListener("timeupdate", updateSubtitle); activeId = ""; updateSubtitle(); }
       sendResponse({ ok: true });
     } else if (message.type === "capture-configuring") {
       sendResponse(configuring(message));
@@ -805,7 +1066,9 @@
       sendResponse({ ok: true });
     } else if (message.type === "capture-saved") {
       transcriptionEnabled = message.transcriptionEnabled === true;
+      enrichmentEnabled = message.enrichmentEnabled === true;
       if (transcriptionEnabled) startTranscriptionPolling(message.manifest.id);
+      if (enrichmentEnabled) startLearningPolling(message.manifest.id);
       try { showSaved(message.manifest); sendResponse({ ok: true }); }
       catch (error) { showStatus(error.message, true); sendResponse({ ok: false, error: error.message }); }
     } else if (message.type === "capture-stop-playback") {
@@ -813,6 +1076,8 @@
       sendResponse({ ok: true });
     } else if (message.type === "capture-failed") {
       stopTranscriptionPolling();
+      stopLearningPolling();
+      suspendLearningDisplay();
       cancelPreparation();
       configured = false;
       busy = false;
@@ -821,7 +1086,7 @@
       setInputsDisabled(false);
       sendResponse({ ok: true });
     } else if (message.type === "capture-reset") {
-      if (!message.complete) stopTranscriptionPolling();
+      if (!message.complete) { stopTranscriptionPolling(); stopLearningPolling(); suspendLearningDisplay(); }
       cancelPreparation();
       stopPlayback();
       configured = false;

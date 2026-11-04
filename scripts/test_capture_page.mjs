@@ -16,6 +16,7 @@ class FakeElement {
     this.style = {};
     this.listeners = new Map();
     this.attributes = new Map();
+    this.dataset = {};
     this.disabled = false;
     this.hidden = false;
     this.textContent = "";
@@ -44,7 +45,7 @@ class FakeElement {
   matches(selector) {
     if (selector.startsWith("#")) return this.id === selector.slice(1);
     const [tag, className] = selector.split(".");
-    return (!tag || this.tagName.toLowerCase() === tag) && (!className || this.classList.contains(className));
+    return (!tag || this.tagName.toLowerCase() === tag) && (!className || this.classList.contains(className) || this.className?.split(" ").includes(className));
   }
   closest(selector) { return this.matches(selector) ? this : this.parentElement?.closest(selector) || null; }
   querySelector(selector) {
@@ -72,11 +73,19 @@ class FakeElement {
       entry.listener({ type, target: this, preventDefault() {} });
     }
   }
-  click() { if (!this.disabled) this.emit("click"); }
+  click() {
+    if (this.disabled) return;
+    this.emit("click");
+    if (this.tagName === "SUMMARY" && this.parentElement?.tagName === "DETAILS") {
+      this.parentElement.open = !this.parentElement.open;
+      this.parentElement.emit("toggle");
+    }
+  }
   getBoundingClientRect() { return { top: 0, left: 0, right: 640, bottom: 360 }; }
 }
 
-function harness({ duration = NaN, pendingPlay = false, failBegin = false, shorts = false, transcriptionEnabled = false, statusReplies = [], foreignPanel = false } = {}) {
+function harness({ duration = NaN, pendingPlay = false, failBegin = false, shorts = false, transcriptionEnabled = false, statusReplies = [], foreignPanel = false,
+  enrichmentEnabled = false, learningReplies = [], learningLoadReply = { capture_id: null, status: "not_found", result: null } } = {}) {
   const timers = new Map();
   const messages = [];
   let time = 0;
@@ -84,6 +93,9 @@ function harness({ duration = NaN, pendingPlay = false, failBegin = false, short
   let listener;
   let releasePlay;
   let statusCalls = 0;
+  let learningCalls = 0;
+  let learningLoadCalls = 0;
+  let playCalls = 0;
   let runtimeFailure;
   let runtimeFailures = 0;
   const video = new FakeElement("video");
@@ -93,6 +105,7 @@ function harness({ duration = NaN, pendingPlay = false, failBegin = false, short
   });
   video.pause = () => { video.paused = true; };
   video.play = () => {
+    playCalls++;
     video.paused = false;
     if (pendingPlay) return new Promise((resolve) => { releasePlay = resolve; });
     video.emit("playing");
@@ -157,6 +170,12 @@ function harness({ duration = NaN, pendingPlay = false, failBegin = false, short
       const value = typeof reply === "function" ? await reply() : await reply;
       return { ok: true, transcription: value };
     }
+    if (message.type === "capture-learning-load" || message.type === "capture-learning-status") {
+      const reply = message.type === "capture-learning-load" ? (learningLoadCalls++, learningLoadReply) :
+        learningReplies[learningCalls++] ?? { capture_id: sessionId, status: "waiting_for_transcription", sentences_done: 0, sentences_total: 0, result: { sentences: [] } };
+      const value = typeof reply === "function" ? await reply() : await reply;
+      return { ok: true, learning: value };
+    }
     return { ok: true };
   }
   const context = vm.createContext({
@@ -180,6 +199,13 @@ function harness({ duration = NaN, pendingPlay = false, failBegin = false, short
   const inputs = elements.filter((element) => element.tagName === "INPUT");
   const close = elements.find((element) => element.tagName === "BUTTON" && element.textContent === "×");
   const transcription = elements.find((element) => element.className === "transcription-status");
+  const learning = elements.find((element) => element.className === "learning-status");
+  const load = elements.find((element) => element.textContent === "读取已保存学习内容");
+  const list = elements.find((element) => element.className === "list");
+  const subtitle = elements.find((element) => element.className === "subtitle");
+  const captureForm = elements.find((element) => element.className === "capture-options");
+  const captureSummary = elements.find((element) => element.className === "capture-summary");
+  const learningToolbar = elements.find((element) => element.className === "learning-toolbar");
   const status = elements.find((element) => element.className === "status");
   assert.ok(begin && cancel && status && inputs.length === 3);
   const dispatch = (type, payload = {}) => new Promise((resolve) => {
@@ -207,7 +233,8 @@ function harness({ duration = NaN, pendingPlay = false, failBegin = false, short
   const metadataListeners = () => ["loadedmetadata", "durationchange", "error", "emptied"]
     .reduce((count, type) => count + (video.listeners.get(type) || []).length, 0);
   return {
-    video, messages, location, begin, cancel, close, inputs, status, transcription, dispatch, advance, metadataListeners,
+    video, messages, location, begin, cancel, close, inputs, status, transcription, learning, load, list, subtitle, captureForm, captureSummary, learningToolbar, dispatch, advance, metadataListeners,
+    get learningCalls() { return learningCalls; }, get learningLoadCalls() { return learningLoadCalls; }, get playCalls() { return playCalls; },
     injectionResult,
     reinject: () => vm.runInContext(source, context),
     forgetPageMarker: () => { delete context.window.__snsJapaneseAgentPage; },
@@ -225,8 +252,8 @@ function harness({ duration = NaN, pendingPlay = false, failBegin = false, short
     replacePlayer(replacement) { player = replacement; },
     releasePlay: () => releasePlay?.(),
     async configure() {
-      await dispatch("capture-configuring", { transcriptionEnabled });
-      return dispatch("capture-configure", { transcriptionEnabled });
+      await dispatch("capture-configuring", { transcriptionEnabled, enrichmentEnabled });
+      return dispatch("capture-configure", { transcriptionEnabled, enrichmentEnabled });
     },
   };
 }
@@ -415,6 +442,7 @@ for (const kind of ["identity", "ad", "detached", "replacement"]) {
   const h = await recording();
   await h.advance(5000);
   assert.equal(h.statusCalls, 0);
+  assert.equal(h.learningCalls, 0, "Capture-only mode must not start learning polls for the new capture");
   assert.equal(h.transcription.hidden, true);
   await h.dispatch("capture-stop-playback");
   console.log("PASS capture-only mode never polls or advertises Google transcription");
@@ -581,9 +609,9 @@ for (const mode of ["sync", "async"]) {
   const h = await recording();
   const handshake = await h.dispatch("page-handshake");
   assert.equal(handshake.ok, true);
-  assert.equal(handshake.version, "0.4.3");
+  assert.equal(handshake.version, "0.5.2");
   assert.equal(handshake.protocol, 1);
-  assert.equal(h.panelVersion, "v0.4.3");
+  assert.equal(h.panelVersion, "v0.5.2");
   assert.equal(h.injectionResult.version, handshake.version);
   assert.equal(h.reinject().version, handshake.version);
   assert.equal(h.panelCount, 1);
@@ -621,10 +649,247 @@ for (const mode of ["sync", "async"]) {
   const h = harness({ duration: 120, foreignPanel: true });
   assert.equal(h.injectionResult.ok, true);
   assert.equal((await h.configure()).ok, true);
-  assert.equal((await h.dispatch("page-handshake")).version, "0.4.3");
+  assert.equal((await h.dispatch("page-handshake")).version, "0.5.2");
   assert.equal(h.panelCount, 1);
   assert.equal(h.foreignPanelConnected, true, "The new extension must not remove another installation's panel");
   assert.equal(h.begin.disabled, false);
   console.log("PASS a legacy panel from another extension cannot block the current extension's namespaced panel");
 }
-console.log("32 offline page lifecycle checks passed.");
+const cachedCaptureId = "00000000-0000-4000-8000-000000000099";
+function studySentence(overrides = {}) {
+  return { id: "s001", text: "何が必要か。", start: 1, end: 3, mapping_uncertain: false,
+    translation_zh: "需要什么呢？", study: { style_version: 2, reading_text: "何(なに)が必要(ひつよう)か。",
+      key_points: ["疑问小句：提出问题。"], context_note: "", asr_doubt: "" }, ...overrides };
+}
+function learningValue({ status = "complete", captureId = cachedCaptureId, revision = 1, items = [studySentence()], total = items.length } = {}) {
+  return { capture_id: captureId, status, revision, sentences_done: items.length, sentences_total: total,
+    batches_done: status === "complete" ? 1 : 0, batches_total: 1, result: { sentences: items } };
+}
+function allText(element) { return [element.textContent, ...element.children.map(allText)].join("\n"); }
+{
+  const h = harness({ duration: 120, learningLoadReply: learningValue({ items: [studySentence(),
+    studySentence({ id: "s002", start: null, end: null, mapping_uncertain: true }),
+    { id: "s003", text: "未注音の原文。", start: 4, end: 5 },
+  ] }) });
+  await h.configure(); await flush();
+  assert.equal(h.learningLoadCalls, 1);
+  assert.equal(h.learningCalls, 0);
+  assert.equal(h.playCalls, 0, "Loading cached notes must not begin playback");
+  assert.equal(h.video.currentTime, 0);
+  assert.equal(h.list.children.length, 2);
+  assert.match(allText(h.list), /何\(なに\)が必要\(ひつよう\)か。/);
+  assert.match(allText(h.list), /需要什么呢/);
+  assert.equal(allText(h.list).includes("未注音の原文"), false);
+  const unmapped = h.list.children[1];
+  assert.equal(unmapped.children[0].disabled, true);
+  assert.match(allText(unmapped), /时间待确认/);
+  const messages = h.messages.length;
+  unmapped.children[1].click();
+  assert.equal(unmapped.children[2].hidden, false, "An unmapped sentence must still offer its saved analysis");
+  assert.equal(h.messages.length, messages, "Analysis expansion must be local DOM only");
+  unmapped.children[0].click();
+  assert.equal(h.video.currentTime, 0, "An unknown video time must never become a seek to zero");
+  h.list.children[0].children[0].click(); await flush();
+  assert.equal(h.video.currentTime, 1);
+  assert.equal(h.playCalls, 1);
+  assert.match(h.subtitle.textContent, /何\(なに\)が必要\(ひつよう\)か。\n需要什么呢/);
+  assert.equal(h.list.children[0].classList.contains("active"), true);
+  assert.equal(h.messages.some((message) => ["capture-begin", "page-started", "capture-transcription-status"].includes(message.type)), false);
+  h.begin.click(); await flush();
+  assert.equal(h.messages.find((message) => message.type === "capture-begin").sessionId, sessionId,
+    "Loading an older cached capture must not replace the live recording session ID");
+  console.log("PASS cached annotated bilingual notes load without recording, and null times disable seeking while local analysis remains usable");
+}
+{
+  const first = learningValue({ status: "running", total: 2 });
+  const second = learningValue({ revision: 2, items: [studySentence(), studySentence({ id: "s002", start: 4, end: 6 })] });
+  const h = harness({ duration: 120, learningLoadReply: first, learningReplies: [second] });
+  await h.configure(); await flush();
+  h.list.children[0].children[1].click();
+  h.list.scrollTop = 123;
+  await h.advance(2500);
+  assert.equal(h.list.children.length, 2);
+  assert.equal(h.list.children[0].children[2].hidden, false);
+  assert.equal(h.list.children[0].children[1].textContent, "收起解析");
+  assert.equal(h.list.scrollTop, 123);
+  assert.equal(h.playCalls, 0);
+  assert.match(h.learning.textContent, /完成.*2\/2/);
+  console.log("PASS learning revisions preserve expanded analyses and list position as later notes arrive");
+}
+{
+  const h = await recording({ transcriptionEnabled: true, enrichmentEnabled: true,
+    statusReplies: [{ status: "complete", windows_done: 3, windows_total: 3, sentences: 1 }],
+    learningReplies: [learningValue({ status: "waiting_for_transcript", captureId: sessionId, items: [], total: 1 }),
+      learningValue({ captureId: sessionId })] });
+  assert.equal(h.statusCalls, 1);
+  assert.equal(h.learningCalls, 1);
+  await h.advance(2500);
+  assert.equal(h.learningCalls, 2, "Google completion must not stop the independent learning poll");
+  assert.equal(h.list.children.length, 1);
+  assert.equal(h.list.children[0].children[0].disabled, true, "New notes must not let the learner seek during capture");
+  const messages = h.messages.length;
+  h.list.children[0].children[1].click();
+  assert.equal(h.messages.length, messages);
+  await h.dispatch("capture-reset", { complete: true });
+  assert.equal(h.list.children[0].children[0].disabled, false);
+  assert.equal(h.statusCalls, 1);
+  console.log("PASS Google and learning polls finish independently and analysis stays local during protected capture playback");
+}
+{
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  const h = await recording({ enrichmentEnabled: true, learningReplies: [pending, learningValue({ captureId: sessionId })] });
+  await h.advance(5000);
+  assert.equal(h.learningCalls, 1, "Only one learning request may be in flight");
+  release(learningValue({ captureId: sessionId, status: "running" })); await flush();
+  await h.advance(2500);
+  assert.equal(h.learningCalls, 2);
+  await h.dispatch("capture-reset", { complete: true });
+  await h.advance(10000);
+  assert.equal(h.learningCalls, 2, "Completed learning must stop status polling");
+  console.log("PASS learning polling is single-flight and stops after its own completion");
+}
+for (const action of ["cancel", "close"]) {
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  const h = await recording({ enrichmentEnabled: true, learningReplies: [pending] });
+  h[action].click(); await flush();
+  release(learningValue({ captureId: sessionId })); await flush();
+  await h.advance(5000);
+  assert.equal(h.learningCalls, 1);
+  assert.equal(h.list.children.length, 0, "A late learning reply must not reopen a cancelled or closed display");
+  assert.equal(h.subtitle.textContent, "");
+  await h.dispatch("capture-stop-playback");
+}
+console.log("PASS cancellation and closure ignore late learning responses and stop learning polling");
+{
+  let reject;
+  const pending = new Promise((_, rejectPromise) => { reject = rejectPromise; });
+  const h = await recording({ enrichmentEnabled: true, learningReplies: [pending] });
+  reject(new Error("Extension context invalidated.")); await flush();
+  assertInvalidated(h);
+  assert.equal(h.learning.hidden, true);
+  assert.equal(h.load.disabled, true);
+  await h.advance(10000);
+  assert.equal(h.learningCalls, 1);
+  console.log("PASS a delayed learning context error performs the same complete stale-page cleanup");
+}
+{
+  const h = harness({ duration: 120 });
+  await h.configure(); await flush();
+  await h.dispatch("result", { result: { sentences: [
+    { id: "bad", text: "帰っていい。", start: 1, end: 2 },
+    studySentence({ id: "rewrite", text: "帰る。", study: { style_version: 2, reading_text: "来(く)る。", key_points: [] } }),
+    { id: "kana", text: "そう(かな)。", start: 3, end: 4 },
+  ] } });
+  assert.equal(h.list.children.length, 1);
+  assert.match(allText(h.list), /そう\(かな\)。/);
+  assert.equal(allText(h.list).includes("帰っていい"), false);
+  console.log("PASS legacy result display cannot fall back to unannotated kanji, while kana-only originals remain readable");
+}
+{
+  const h = harness({ duration: 120, learningLoadReply: learningValue({ status: "not_started", items: [] }) });
+  await h.configure(); await flush();
+  await h.advance(10000);
+  assert.equal(h.learningCalls, 0);
+  assert.equal(h.learningLoadCalls, 1);
+  assert.match(h.learning.textContent, /自动处理未启用/);
+  console.log("PASS disabled enrichment stops at an unprocessed cached capture without a paid fallback or endless polling");
+}
+{
+  const attention = { ...learningValue({ status: "needs_attention", total: 2 }), batches_done: 0, batches_total: 2, blocked_batches: 1 };
+  const h = harness({ duration: 120, enrichmentEnabled: true, learningLoadReply: attention,
+    learningReplies: [learningValue({ status: "running", revision: 2, total: 2 }),
+      learningValue({ revision: 3, items: [studySentence(), studySentence({ id: "s002", start: 4, end: 6 })] })] });
+  await h.configure(); await flush();
+  assert.match(h.learning.textContent, /正在确认进度/);
+  await h.advance(2500);
+  assert.equal(h.learningCalls, 1);
+  await h.advance(2500);
+  assert.equal(h.learningCalls, 2);
+  assert.equal(h.list.children.length, 2);
+  assert.match(h.learning.textContent, /完成.*2\/2/);
+  const requests = h.messages.filter((message) => message.type.startsWith("capture-learning"));
+  assert.ok(requests.every((message) => ["capture-learning-load", "capture-learning-status"].includes(message.type)));
+  console.log("PASS a transient partial-batch warning keeps polling independent work until later notes complete");
+}
+{
+  const attention = { ...learningValue({ status: "needs_attention", total: 2 }), batches_done: 0, batches_total: 2, blocked_batches: 1 };
+  const h = harness({ duration: 120, enrichmentEnabled: true, learningLoadReply: attention, learningReplies: [attention] });
+  await h.configure(); await flush();
+  await h.advance(2500);
+  assert.equal(h.learningCalls, 1);
+  await h.advance(10000);
+  assert.equal(h.learningCalls, 1, "Two identical needs-attention observations must stop polling within a bounded grace period");
+  assert.match(h.learning.textContent, /需检查/);
+  console.log("PASS a persistently unchanged partial-batch warning stops after two matching observations");
+}
+{
+  const h = harness({ duration: 120 });
+  await h.configure(); await flush();
+  assert.equal(h.captureForm.tagName, "DETAILS");
+  assert.equal(h.captureSummary.tagName, "SUMMARY");
+  assert.equal(h.captureForm.open, true, "Without cached notes the capture fields must be available by default");
+  assert.equal(h.captureForm.contains(h.learning), false);
+  assert.equal(h.captureForm.contains(h.load), false);
+  assert.equal(h.captureForm.contains(h.cancel), false);
+  assert.equal(h.learningToolbar.contains(h.cancel), true, "Release must remain accessible outside the collapsed form");
+  h.captureSummary.click();
+  assert.equal(h.captureForm.open, false);
+  h.captureSummary.click();
+  h.begin.click(); await flush();
+  assert.equal(h.messages.find((message) => message.type === "capture-begin").sessionId, sessionId);
+  console.log("PASS capture settings use a native disclosure while learning and release controls stay outside it");
+}
+{
+  const h = harness({ duration: 120, enrichmentEnabled: true,
+    learningLoadReply: learningValue({ status: "running", total: 2 }),
+    learningReplies: [learningValue({ revision: 2, items: [studySentence(), studySentence({ id: "s002", start: 4, end: 6 })] })] });
+  await h.configure(); await flush();
+  assert.equal(h.captureForm.open, false, "Ready notes must automatically reclaim space from the capture form");
+  assert.equal(h.list.children.length, 1);
+  h.captureSummary.click();
+  assert.equal(h.captureForm.open, true);
+  h.list.children[0].children[1].click();
+  await h.advance(2500);
+  assert.equal(h.captureForm.open, true, "A later revision must respect the learner's explicit expansion");
+  assert.equal(h.list.children.length, 2);
+  assert.equal(h.list.children[0].children[2].hidden, false);
+  h.captureSummary.click();
+  assert.equal(h.captureForm.open, false);
+  h.cancel.click(); await flush();
+  assert.equal(h.messages.filter((message) => message.type === "capture-cancel").length, 1);
+  assert.equal(h.list.children.length, 2, "Collapsing or cancelling capture must not delete already displayed notes");
+  console.log("PASS ready notes collapse settings once and later notes preserve manual expansion and open analysis");
+}
+{
+  const h = await recording({ enrichmentEnabled: true, learningReplies: [learningValue({ captureId: sessionId })] });
+  await flush();
+  assert.equal(h.captureForm.open, false);
+  assert.equal(h.video.paused, false, "Automatic form collapse must not interrupt recording playback");
+  assert.equal(h.cancel.disabled, false);
+  assert.equal(h.learningToolbar.contains(h.cancel), true);
+  h.cancel.click(); await flush();
+  assert.equal(h.messages.filter((message) => message.type === "capture-cancel").length, 1);
+  await h.dispatch("capture-stop-playback");
+  assert.equal(h.video.paused, true);
+  console.log("PASS automatic learning layout changes preserve live recording and its always-visible release action");
+}
+{
+  const h = harness({ duration: 120, learningLoadReply: learningValue({ items: [
+    studySentence({ mapping_uncertain: true }),
+    studySentence({ id: "s002", start: 4, end: 6, mapping_uncertain: true }),
+  ] }) });
+  await h.configure(); await flush();
+  const note = "字幕时间由播放记录估算。";
+  assert.equal(h.learningToolbar.children.find((element) => element.className === "alignment-note").hidden, false);
+  assert.equal(allText(h.learningToolbar).split(note).length - 1, 1,
+    "Estimated mapped times should produce one shared informational note");
+  assert.equal(allText(h.list).includes("时间映射有误差"), false);
+  assert.equal(allText(h.list).includes("对齐待核对"), false);
+  assert.equal(allText(h.list).includes(note), false);
+  assert.ok(h.list.children.every((entry) => entry.children[0].disabled === false),
+    "A mapped estimate remains usable for sentence playback");
+  console.log("PASS mapped timing uncertainty is explained once without repetitive per-sentence error warnings");
+}
+console.log("46 offline page lifecycle, layout, and learning checks passed.");

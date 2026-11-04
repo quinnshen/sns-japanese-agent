@@ -8,7 +8,7 @@ const extensionId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const origin = `chrome-extension://${extensionId}/`;
 const videoUrl = "https://www.youtube.com/watch?v=AbCdEf012_-";
 const tab = { id: 7, url: videoUrl };
-const pageMetadata = { ok: true, version: "0.4.3", protocol: 1 };
+const pageMetadata = { ok: true, version: "0.5.2", protocol: 1 };
 const tick = async () => { for (let i = 0; i < 120; i++) await Promise.resolve(); };
 async function until(check) { for (let i = 0; i < 20; i++) { if (check()) return; await tick(); } assert.ok(check(), "Lifecycle did not reach expected state"); }
 function deferred() { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; }
@@ -22,11 +22,13 @@ function clock() {
 }
 function workerHarness({ initial, documentExists = false, inspect = { ok: true, phase: "ready" }, streamId, stallAbort = false,
   transcriptionEnabled = false, transcriptionReply = {}, injectionResults = [{ frameId: 0, result: pageMetadata }],
-  handshakeReply = pageMetadata, statusUnavailable = false } = {}) {
+  handshakeReply = pageMetadata, statusUnavailable = false, enrichmentEnabled = false,
+  learningReply = {}, latestLearningReply = learningReply, currentTabUrl = videoUrl } = {}) {
   const timer = clock(); let action; let listener; let stored = initial; let contexts = documentExists;
   let serial = 0; let closeCount = 0; let streamCalls = 0; let createCount = 0; let contextCalls = 0;
   const pageMessages = []; const offscreenMessages = []; const fetches = [];
   const injections = []; const badges = []; const titles = []; const lifecycle = []; const pageTargets = [];
+  const fetchOptions = [];
   const chrome = {
     action: { onClicked: { addListener(fn) { action = fn; } },
       async setBadgeText(value) { badges.push(structuredClone(value)); }, async setBadgeBackgroundColor() {},
@@ -54,7 +56,7 @@ function workerHarness({ initial, documentExists = false, inspect = { ok: true, 
     offscreen: { async createDocument() { lifecycle.push("create-offscreen"); contexts = true; createCount++; }, async closeDocument() { contexts = false; closeCount++; } },
     tabCapture: { async getMediaStreamId() { lifecycle.push("stream"); streamCalls++; return streamId ? streamId(streamCalls) : "synthetic-stream"; } },
     tabs: {
-      async get() { return tab; }, async create() {}, onRemoved: { addListener() {} },
+      async get() { return { ...tab, url: currentTabUrl }; }, async create() {}, onRemoved: { addListener() {} },
       async sendMessage(tabId, message, options) {
         pageMessages.push(structuredClone(message)); pageTargets.push({ tabId, options: structuredClone(options) });
         if (message.type === "page-handshake") {
@@ -67,15 +69,20 @@ function workerHarness({ initial, documentExists = false, inspect = { ok: true, 
     },
   };
   const context = vm.createContext({ chrome, URL, AbortController, ...timer, crypto: { randomUUID() { return `00000000-0000-4000-8000-${String(++serial).padStart(12, "0")}`; } },
-    async fetch(url) {
+    async fetch(url, options) {
       lifecycle.push("fetch"); fetches.push(url);
+      fetchOptions.push(structuredClone({ method: options?.method || "GET", credentials: options?.credentials }));
       return { ok: true, async json() {
-        return url.endsWith("/health") ? { capabilities: { capture_batches: true, capture_transcription: transcriptionEnabled } } : transcriptionReply;
+        const path = new URL(url).pathname;
+        if (path === "/health") return { capabilities: { capture_batches: true, capture_transcription: transcriptionEnabled, capture_enrichment: enrichmentEnabled } };
+        if (path === "/learning/latest") return latestLearningReply;
+        if (path.endsWith("/learning")) return learningReply;
+        return transcriptionReply;
       } };
     },
   });
   vm.runInContext(workerSource, context);
-  return { timer, pageMessages, offscreenMessages, fetches, injections, badges, titles, lifecycle, pageTargets,
+  return { timer, pageMessages, offscreenMessages, fetches, fetchOptions, injections, badges, titles, lifecycle, pageTargets,
     click: () => action(tab), get stored() { return stored; }, get closeCount() { return closeCount; }, get streamCalls() { return streamCalls; },
     get createCount() { return createCount; }, get contextCalls() { return contextCalls; },
     message: (payload, senderOverride = {}) => new Promise((resolve) => { listener({ target: "worker", ...payload }, { id: extensionId, tab, frameId: 0, ...senderOverride }, resolve); }),
@@ -369,4 +376,114 @@ function assertDiagnostic(h, code) {
   assert.equal(h.streamCalls, 1);
   console.log("PASS a later valid action clears an earlier diagnostic and prepares exactly one capture");
 }
-console.log("19 preparation, handshake, diagnostic, status, and failure lifecycle checks passed.");
+function readySentence(overrides = {}) {
+  return { id: "s001", text: "何が必要か。", start: 1, end: 3, audio_start: 1, audio_end: 3,
+    translation_zh: "需要什么呢？", study: { style_version: 2, reading_text: "何(なに)が必要(ひつよう)か。",
+      key_points: ["疑问小句：提出问题。"], context_note: "", asr_doubt: "" }, ...overrides };
+}
+{
+  const h = workerHarness({ learningReply: { status: "complete", sentences_done: 1, sentences_total: 3,
+    batches_done: 1, batches_total: 1, revision: 1, result_available: true,
+    error: "synthetic-private-marker", model: "synthetic-private-marker", source_url: "synthetic-private-marker",
+    blocked_batches: [{ secret: "synthetic-private-marker" }],
+    result: { raw_transcripts: [{ text: "synthetic-private-marker" }], sentences: [
+      readySentence(), readySentence({ id: "s002", study: undefined }),
+      readySentence({ id: "s003", study: { style_version: 2, reading_text: "何が必要か。", key_points: [] } }),
+    ] } } });
+  const response = await h.message({ type: "capture-learning-status", captureId: "00000000-0000-4000-8000-000000000099" });
+  assert.equal(response.ok, true);
+  assert.equal(response.learning.result.sentences.length, 1);
+  assert.equal(response.learning.result.sentences[0].study.reading_text, "何(なに)が必要(ひつよう)か。");
+  assert.equal("text" in response.learning.result.sentences[0], false, "The worker must not forward raw ASR originals");
+  assert.equal(JSON.stringify(response).includes("synthetic-private-marker"), false);
+  assert.equal(response.learning.blocked_batches, 1);
+  assert.equal(h.fetchOptions[0].method, "GET");
+  assert.equal(h.fetchOptions[0].credentials, "omit");
+  assert.equal(h.offscreenMessages.length, 0);
+  console.log("PASS learning status forwards validated annotated notes and safe counts without raw ASR or unknown metadata");
+}
+{
+  for (const [original, reading, accepted] of [
+    ["そう(かな)。", "そう(かな)。", true],
+    ["そう(かな)。", "そう。", false],
+    ["何(なに)が必要か。", "何(なに)が必要(ひつよう)か。", true],
+    ["物理的に持って。", "物理的(ぶつりてき)に持(も)って。", true],
+    ["彼は(たぶん)帰る。", "彼(かれ)は(たぶん)帰(かえ)る。", true],
+    ["彼は帰る。", "彼(かれ)は来(く)る。", false],
+    ["物理的。", "物理(ぶつり)的。", false],
+  ]) {
+    const h = workerHarness({ learningReply: { status: "complete", result: { sentences: [readySentence({
+      text: original, study: { style_version: 2, reading_text: reading, key_points: [], asr_doubt: "需要回听确认。", context_note: "" },
+    })] } } });
+    const response = await h.message({ type: "capture-learning-status", captureId: "00000000-0000-4000-8000-000000000099" });
+    assert.equal(response.learning.result.sentences.length, accepted ? 1 : 0, `${original} -> ${reading}`);
+  }
+  console.log("PASS source-aware reading validation preserves literal kana parentheses and accepts compound or split kanji readings");
+}
+{
+  const h = workerHarness({ latestLearningReply: { capture_id: "00000000-0000-4000-8000-000000000099", status: "complete",
+    result: { sentences: [readySentence()] } } });
+  const response = await h.message({ type: "capture-learning-load", url: "https://example.invalid/forged-source", captureId: "../forged" });
+  assert.equal(response.learning.capture_id, "00000000-0000-4000-8000-000000000099");
+  assert.equal(new URL(h.fetches[0]).pathname, "/learning/latest");
+  assert.equal(new URL(h.fetches[0]).searchParams.get("url"), videoUrl);
+  assert.equal(h.fetchOptions[0].method, "GET");
+  assert.equal(h.stored, undefined);
+  assert.equal(h.streamCalls, 0);
+  assert.equal(h.offscreenMessages.length, 0);
+  console.log("PASS cached learning load uses the current sender tab URL and never starts recording or processing");
+}
+{
+  const h = workerHarness();
+  for (const [payload, sender] of [
+    [{ type: "capture-learning-status", captureId: "../invalid" }, {}],
+    [{ type: "capture-learning-load" }, { frameId: 1 }],
+    [{ type: "capture-learning-load" }, { id: "untrusted-extension" }],
+    [{ type: "capture-learning-load" }, { tab: { id: 7, url: "https://example.invalid" } }],
+  ]) assert.equal((await h.message(payload, sender)).ok, false);
+  assert.equal(h.fetches.length, 0);
+  const moved = workerHarness({ currentTabUrl: "https://example.invalid" });
+  assert.equal((await moved.message({ type: "capture-learning-load" })).ok, false);
+  assert.equal(moved.fetches.length, 0);
+  console.log("PASS learning requests reject foreign, subframe, malformed and navigated-away senders before local access");
+}
+{
+  const h = workerHarness({ transcriptionEnabled: true, enrichmentEnabled: true });
+  h.click(); await until(() => h.pageMessages.some((message) => message.type === "status" && /GPT.*预生成/.test(message.text)));
+  assert.equal(h.stored.enrichmentEnabled, true);
+  assert.equal(h.pageMessages.find((message) => message.type === "capture-configure").enrichmentEnabled, true);
+  assert.match(h.titles.at(-1).title, /GPT.*预生成/);
+  const id = h.stored.sessionId;
+  await h.message({ type: "capture-complete", sessionId: id, manifest: { id } }, { tab: undefined, url: origin + "offscreen.html" });
+  assert.equal(h.pageMessages.find((message) => message.type === "capture-saved").enrichmentEnabled, true);
+  assert.match(h.titles.at(-1).title, /翻译和解析.*后台/);
+  assert.equal(h.titles.at(-1).title.includes("未调用 GPT"), false);
+  console.log("PASS enabled enrichment is announced honestly during capture readiness and completion");
+}
+{
+  const h = workerHarness({ latestLearningReply: { capture_id: null, status: "not_found", result: null } });
+  const response = await h.message({ type: "capture-learning-load" });
+  assert.equal(response.learning.capture_id, null);
+  assert.equal(response.learning.status, "not_found");
+  assert.equal(response.learning.result_available, false);
+  assert.equal(response.learning.result.sentences.length, 0);
+  console.log("PASS missing cached learning is a read-only empty result without a paid fallback");
+}
+{
+  const h = workerHarness({ transcriptionEnabled: false, enrichmentEnabled: true });
+  h.click(); await until(() => h.pageMessages.some((message) => message.type === "status" && message.text.startsWith("选择采集范围")));
+  assert.equal(h.stored.transcriptionEnabled, false);
+  assert.equal(h.stored.enrichmentEnabled, false,
+    "New-capture enrichment requires Google transcription even when saved-ASR enrichment is enabled on the backend");
+  const configured = h.pageMessages.find((message) => message.type === "capture-configure");
+  assert.equal(configured.enrichmentEnabled, false, "The page must not start new-capture learning polls without ASR");
+  assert.match(h.titles.at(-1).title, /不调用云端服务/);
+  const id = h.stored.sessionId;
+  await h.message({ type: "capture-complete", sessionId: id, manifest: { id } }, { tab: undefined, url: origin + "offscreen.html" });
+  const saved = h.pageMessages.find((message) => message.type === "capture-saved");
+  assert.equal(saved.enrichmentEnabled, false);
+  assert.match(h.titles.at(-1).title, /未调用 Google 或 GPT/);
+  assert.deepEqual(h.fetches.map((url) => new URL(url).pathname), ["/health"]);
+  console.log("PASS new-capture GPT mode requires Google ASR while saved learning remains independently readable");
+}
+console.log("26 preparation, handshake, learning, diagnostic, status, and failure lifecycle checks passed.");

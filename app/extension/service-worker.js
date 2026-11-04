@@ -1,6 +1,6 @@
 const SESSION_KEY = "activeCapture";
 const API = "http://127.0.0.1:8766";
-const PAGE_VERSION = "0.4.3";
+const PAGE_VERSION = "0.5.2";
 const PAGE_PROTOCOL = 1;
 let creatingOffscreen;
 let opening = false;
@@ -130,7 +130,9 @@ async function openAgent(tab) {
             active.phase = "ready";
             await checkCurrent(active);
             await chrome.storage.session.set({ [SESSION_KEY]: active });
-            await status(tab.id, active.transcriptionEnabled
+            await status(tab.id, active.enrichmentEnabled
+              ? "音频已准备。开始采集后将分批发送 Google 转写，并自动预生成翻译和解析。"
+              : active.transcriptionEnabled
               ? "音频已准备。选择范围后点击开始；开始采集后将分批发送 Google 转写。"
               : "音频已准备。选择范围后点击开始；尚未录音。");
           } else if (inspected?.ok && inspected.phase === "failed") {
@@ -156,7 +158,8 @@ async function openAgent(tab) {
     } finally { clearTimeout(timeout); }
     if (!health.capabilities?.capture_batches) throw new Error("请启动支持分批采集的新版本本机后端。");
     session = { tabId: tab.id, sessionId: crypto.randomUUID(), sourceUrl: tab.url, phase: "preparing",
-      transcriptionEnabled: health.capabilities?.capture_transcription === true };
+      transcriptionEnabled: health.capabilities?.capture_transcription === true,
+      enrichmentEnabled: health.capabilities?.capture_enrichment === true && health.capabilities?.capture_transcription === true };
     await chrome.storage.session.set({ [SESSION_KEY]: session });
     await pageMessage(tab.id, { type: "capture-configuring", ...session });
     await status(tab.id, "正在准备音频采集环境…若视频尚未加载，请先让它正常播放。");
@@ -182,7 +185,9 @@ async function openAgent(tab) {
     await checkCurrent(session);
     session.phase = "ready";
     await chrome.storage.session.set({ [SESSION_KEY]: session });
-    await status(tab.id, session.transcriptionEnabled
+    await status(tab.id, session.enrichmentEnabled
+      ? "选择采集范围后开始。将分批发送 Google 转写，并自动调用 GPT 预生成翻译和解析；点击解析只展示已保存内容。"
+      : session.transcriptionEnabled
       ? "选择采集范围和上传间隔，再点击开始。开始采集后将分批发送 Google 转写，不调用 GPT。"
       : "选择采集范围和上传间隔，再点击开始。尚未录音，不调用云端服务。");
   } catch (error) {
@@ -272,8 +277,11 @@ async function handleMessage(message, sender) {
       break;
     case "capture-complete":
       await pageMessage(session.tabId, { type: "capture-saved", sessionId: session.sessionId, manifest: message.manifest,
-        transcriptionEnabled: session.transcriptionEnabled === true }).catch(() => {});
-      await status(session.tabId, session.transcriptionEnabled
+        transcriptionEnabled: session.transcriptionEnabled === true,
+        enrichmentEnabled: session.enrichmentEnabled === true }).catch(() => {});
+      await status(session.tabId, session.enrichmentEnabled
+        ? "所有音频批次已保存。Google 转写、翻译和解析在后台处理，已生成的学习内容会自动显示。"
+        : session.transcriptionEnabled
         ? "所有音频批次已保存并合并，可回放检查。Google 转写在后台处理，进度见下方；未调用 GPT。"
         : "所有批次已保存并合并，可回放检查。此次未调用 Google 或 GPT。");
       await finish(session, { complete: true });
@@ -320,8 +328,106 @@ async function transcriptionStatus(captureId) {
   } finally { clearTimeout(timer); }
 }
 
+function validCaptureId(value) {
+  return /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(value || "");
+}
+
+function annotatedReading(text, reading) {
+  if (typeof text !== "string" || typeof reading !== "string" || !reading || reading.length > 32000) return false;
+  const han = (value) => /[㐀-䶿一-鿿豈-﫿々〆ヶ\u{20000}-\u{2EBEF}]/u.test(value || "");
+  if (han(reading.replace(/[㐀-䶿一-鿿豈-﫿々〆ヶ\u{20000}-\u{2EBEF}]+\([ぁ-ゖァ-ヺーゝゞヽヾ]+\)/gu, ""))) return false;
+  // Preserve literal kana parentheses already in ASR; only newly inserted readings may be skipped.
+  let positions = new Set([0]);
+  let previous = "";
+  for (const character of text) {
+    const next = new Set();
+    for (const position of positions) {
+      const candidates = [position];
+      const annotation = han(previous) && /^\([ぁ-ゖァ-ヺーゝゞヽヾ]+\)/u.exec(reading.slice(position));
+      if (annotation) candidates.push(position + annotation[0].length);
+      for (const candidate of candidates) if (reading.startsWith(character, candidate)) next.add(candidate + character.length);
+    }
+    positions = next;
+    previous = character;
+    if (!positions.size) return false;
+  }
+  for (const position of positions) {
+    if (position === reading.length) return true;
+    if (han(previous) && /^\([ぁ-ゖァ-ヺーゝゞヽヾ]+\)$/u.test(reading.slice(position))) return true;
+  }
+  return false;
+}
+
+function safeLearningResult(value) {
+  const sentences = [];
+  const ids = new Set();
+  const text = (item, limit) => typeof item === "string" && item.length <= limit ? item : "";
+  const seconds = (item) => typeof item === "number" && Number.isFinite(item) && item >= 0 ? item : null;
+  for (const item of Array.isArray(value?.sentences) ? value.sentences.slice(0, 10000) : []) {
+    const study = item?.study;
+    if (!study || study.style_version !== 2 || !/^[a-zA-Z0-9_-]{1,100}$/.test(item.id || "") || ids.has(item.id)) continue;
+    if (!annotatedReading(item.text, study.reading_text)) continue;
+    const translation = text(item.translation_zh, 16000);
+    const points = Array.isArray(study.key_points) ? study.key_points : [];
+    if (!translation || !Array.isArray(study.key_points) || points.length > 8 || points.some((point) => !text(point, 8000))) continue;
+    ids.add(item.id);
+    // The learner receives validated notes only, never the raw ASR text or unknown backend fields.
+    sentences.push({ id: item.id, start: seconds(item.start), end: seconds(item.end),
+      audio_start: seconds(item.audio_start), audio_end: seconds(item.audio_end),
+      mapping_uncertain: item.mapping_uncertain === true || seconds(item.start) === null || seconds(item.end) === null,
+      translation_zh: translation, study: { style_version: 2, reading_text: study.reading_text,
+        key_points: points.slice(), context_note: text(study.context_note, 8000), asr_doubt: text(study.asr_doubt, 8000) } });
+  }
+  return { sentences };
+}
+
+function safeLearningStatus(value, captureId) {
+  const statuses = new Set(["not_found", "not_started", "queued", "scheduled", "running", "processing", "prepared", "waiting_for_audio",
+    "waiting_for_transcript", "waiting_for_transcription", "waiting_for_sentences", "request_budget_reached", "needs_attention", "paused", "disabled", "complete", "error"]);
+  const count = (item) => Number.isSafeInteger(item) && item >= 0 && item <= 1_000_000 ? item : 0;
+  const result = safeLearningResult(value?.result);
+  return { capture_id: validCaptureId(captureId) ? captureId : null,
+    status: statuses.has(value?.status) ? value.status : "error",
+    batches_done: count(value?.batches_done), batches_total: count(value?.batches_total),
+    sentences_done: count(value?.sentences_done), sentences_total: count(value?.sentences_total),
+    invalid_sentences: count(value?.invalid_sentences),
+    blocked_batches: Array.isArray(value?.blocked_batches) ? value.blocked_batches.length : count(value?.blocked_batches),
+    result_available: result.sentences.length > 0,
+    revision: Number.isSafeInteger(value?.revision) && value.revision >= 0 ? value.revision : 0,
+    result };
+}
+
+async function learningStatus(path, captureId) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const response = await fetch(`${API}${path}`, { signal: controller.signal, credentials: "omit" });
+    if (!response.ok) throw new Error("Local learning status unavailable");
+    const value = await response.json();
+    return { ok: true, learning: safeLearningStatus(value, captureId || value.capture_id) };
+  } catch (_) {
+    return { ok: false, error: "无法读取本机学习内容。查询不会触发云端处理。" };
+  } finally { clearTimeout(timer); }
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.target !== "worker") return;
+  if (message.type === "capture-learning-status" || message.type === "capture-learning-load") {
+    if (sender.id !== chrome.runtime.id || !sender.tab || sender.frameId !== 0 ||
+        !validVideoUrl(sender.url || sender.tab.url) ||
+        (message.type === "capture-learning-status" && !validCaptureId(message.captureId))) {
+      sendResponse({ ok: false, error: "学习内容请求无效。" });
+      return;
+    }
+    const action = async () => {
+      if (message.type === "capture-learning-status") return learningStatus(`/captures/${message.captureId}/learning`, message.captureId);
+      const currentTab = await chrome.tabs.get(sender.tab.id);
+      if (!validVideoUrl(currentTab.url)) return { ok: false, error: "请在当前 YouTube 视频读取学习内容。" };
+      return learningStatus(`/learning/latest?url=${encodeURIComponent(currentTab.url)}`);
+    };
+    action().then(sendResponse).catch(() => sendResponse({ ok: false, error: "无法读取本机学习内容。" }));
+    return true;
+  }
   if (message.type === "capture-transcription-status") {
     if (sender.id !== chrome.runtime.id || !sender.tab || sender.frameId !== 0 ||
         !validVideoUrl(sender.url || sender.tab.url) ||

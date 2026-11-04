@@ -119,6 +119,35 @@ class TranscriptionSchedulerTests(unittest.TestCase):
             self.assertEqual(workflow._dirty, set())
             self.assertTrue(scheduler.threads[0].finished)
 
+    def test_saved_result_wakes_learning_outside_google_slot_without_retrying_its_failure(self):
+        worker = Mock(return_value={"status": "complete", "result_available": True})
+        callbacks = []
+
+        def on_result(capture_dir):
+            acquired = workflow._cloud_slot.acquire(blocking=False)
+            self.assertTrue(acquired, "The downstream stage must not hold Google's cloud slot")
+            if acquired:
+                workflow._cloud_slot.release()
+            callbacks.append(capture_dir)
+            raise RuntimeError("Synthetic downstream scheduling failure")
+
+        with self.scheduler(worker) as scheduler:
+            workflow.request_processing(self.capture, on_result=on_result)
+            scheduler.threads[0].join()
+            self.assertEqual(callbacks, [self.capture])
+            self.assertEqual(worker.call_count, 1)
+            scheduler.write_status.assert_not_called()
+            self.assertEqual(workflow._active, set())
+
+    def test_waiting_for_audio_does_not_wake_learning_without_a_saved_result(self):
+        worker = Mock(return_value={"status": "waiting_for_audio", "result_available": False})
+        on_result = Mock()
+        with self.scheduler(worker) as scheduler:
+            workflow.request_processing(self.capture, on_result=on_result)
+            scheduler.threads[0].join()
+            on_result.assert_not_called()
+            self.assertEqual(worker.call_count, 1)
+
     def test_exhausted_busy_budget_releases_capture_for_a_new_wake(self):
         worker = Mock(side_effect=workflow.TranscriptionError("worker_already_running"))
         with self.scheduler(worker) as scheduler:

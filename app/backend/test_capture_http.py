@@ -77,7 +77,7 @@ class CaptureHTTPTests(unittest.TestCase):
         handler = self.handler("/health")
         handler.do_GET()
         handler.send_json.assert_called_once_with(200, {
-            "ok": True, "capabilities": {"capture_batches": True, "cloud_processing": False, "capture_transcription": False},
+            "ok": True, "capabilities": {"capture_batches": True, "cloud_processing": False, "capture_transcription": False, "capture_enrichment": False},
         })
         status, _ = self.post("/jobs", {})
         self.assertEqual(status, 409)

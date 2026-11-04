@@ -228,7 +228,7 @@ def read_result(capture_dir: Path) -> dict | None:
     return json.loads(path.read_text()) if path.exists() else None
 
 
-def request_processing(capture_dir: Path, *, enabled=lambda: True) -> None:
+def request_processing(capture_dir: Path, *, enabled=lambda: True, on_result=None) -> None:
     """Coalesce upload notifications; never run decoding or cloud RPCs on the ACK thread."""
     key = str(Path(capture_dir).resolve())
     with _scheduler_lock:
@@ -242,10 +242,12 @@ def request_processing(capture_dir: Path, *, enabled=lambda: True) -> None:
         busy_waits = 0
         try:
             while enabled():
+                saved = False
                 try:
                     with _cloud_slot:
                         if enabled():
-                            process_capture(Path(capture_dir), run_google=True, dispatch_allowed=enabled)
+                            status = process_capture(Path(capture_dir), run_google=True, dispatch_allowed=enabled)
+                            saved = bool(status and status.get("result_available"))
                 except TranscriptionError as error:
                     if error.code == "worker_already_running" and busy_waits < 150:
                         busy_waits += 1
@@ -259,6 +261,12 @@ def request_processing(capture_dir: Path, *, enabled=lambda: True) -> None:
                     if not isinstance(code, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code):
                         code = "local_transcription_failed"
                     atomic_json(private_root(capture_dir) / "status.json", {"status": "error", "error_code": code})
+                if saved and on_result is not None:
+                    try:
+                        on_result(Path(capture_dir))
+                    except Exception:
+                        # Learning has its own state; its failure cannot invalidate ASR results.
+                        pass
                 with _scheduler_lock:
                     if key not in _dirty:
                         _active.discard(key)

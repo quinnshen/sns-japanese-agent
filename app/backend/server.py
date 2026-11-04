@@ -34,10 +34,33 @@ def transcription_enabled() -> bool:
     return setting("ENABLE_CAPTURE_TRANSCRIPTION", "0") == "1"
 
 
+def learning_enabled() -> bool:
+    return setting("ENABLE_CAPTURE_ENRICHMENT", "0") == "1"
+
+
+def capture_processing_allowed(capture_dir: Path, stage_enabled) -> bool:
+    """Recheck explicit cancellation before each new cloud request."""
+    try:
+        if not stage_enabled():
+            return False
+        manifest = capture_store(DATA_DIR / "captures").get(capture_dir.name)
+        return manifest["status"] in {"recording", "complete"}
+    except (CaptureError, OSError, ValueError, TypeError, KeyError):
+        return False
+
+
+def wake_learning(capture_dir: Path) -> None:
+    if learning_enabled():
+        from capture_learning import request_learning
+        request_learning(capture_dir, enabled=lambda: capture_processing_allowed(capture_dir, learning_enabled))
+
+
 def wake_transcription(manifest: dict) -> None:
     if transcription_enabled() and manifest["status"] in {"recording", "complete"}:
         from capture_transcription import request_processing
-        request_processing(DATA_DIR / "captures" / manifest["id"], enabled=transcription_enabled)
+        directory = DATA_DIR / "captures" / manifest["id"]
+        request_processing(directory, enabled=lambda: capture_processing_allowed(directory, transcription_enabled),
+                           on_result=wake_learning)
 
 
 def trusted_request_source(host: str, origin: str) -> bool:
@@ -76,6 +99,35 @@ def latest_result_for_url(url: str) -> dict | None:
         if video_key(result.get("source", {}).get("url", "")) == key:
             return result
     return None
+
+
+def latest_learning_for_url(url: str) -> dict | None:
+    """Read cached notes for this video; never schedule a provider request."""
+    key = video_key(url)
+    if not key:
+        return None
+    from capture_learning import LearningError, read_learning_result, read_learning_status
+    root = DATA_DIR / "captures"
+    if not root.is_dir() or root.is_symlink():
+        return None
+    candidates = []
+    for path in root.glob("*/manifest.json"):
+        try:
+            if path.is_symlink() or path.parent.is_symlink():
+                continue
+            manifest = capture_store(root).get(path.parent.name)
+            if video_key(manifest.get("source_url", "")) != key:
+                continue
+            result = read_learning_result(path.parent)
+            status = read_learning_status(path.parent)
+            ready = sum(bool(sentence.get("study")) for sentence in (result or {}).get("sentences", []))
+            saved = path.parent / "learning" / "result.json"
+            modified = saved.stat().st_mtime if saved.exists() else path.stat().st_mtime
+            candidates.append((ready > 0, modified, {"capture_id": manifest["id"], **status, "result": result}))
+        except (CaptureError, LearningError, OSError, ValueError, TypeError, KeyError):
+            # A damaged or incomplete old recording must not hide other saved notes.
+            continue
+    return max(candidates, key=lambda item: (item[0], item[1]))[2] if candidates else None
 
 
 def run_job(job_id: str, path: Path, duration: float, offset: float, url: str) -> None:
@@ -314,13 +366,37 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "capabilities": {
                     "capture_batches": True,
-                    "cloud_processing": setting("ENABLE_LEGACY_PIPELINE", "0") == "1" or transcription_enabled(),
+                    "cloud_processing": setting("ENABLE_LEGACY_PIPELINE", "0") == "1" or transcription_enabled() or learning_enabled(),
                     "capture_transcription": transcription_enabled(),
+                    "capture_enrichment": learning_enabled(),
                 },
             })
             return
+        parsed_path = urlparse(self.path)
+        if parsed_path.path == "/learning/latest":
+            try:
+                parameters = parse_qs(parsed_path.query)
+                values = parameters.get("url", [])
+                if len(self.path) > 8192 or set(parameters) != {"url"} or len(values) != 1 or not video_key(values[0]):
+                    self.send_json(400, {"error": "Expected one YouTube video URL"})
+                    return
+                payload = latest_learning_for_url(values[0])
+                self.send_json(200, payload or {"capture_id": None, "status": "not_found", "result": None})
+            except (OSError, ValueError, TypeError, KeyError):
+                self.send_json(500, {"error": "Local learning storage operation failed"})
+            return
         if self.path.startswith("/captures/"):
             try:
+                learning_match = re.fullmatch(r"/captures/([0-9a-f-]{36})/learning", self.path)
+                if learning_match:
+                    from capture_learning import LearningError, read_learning_status, read_learning_result
+                    capture_store(DATA_DIR / "captures").get(learning_match[1])
+                    directory = DATA_DIR / "captures" / learning_match[1]
+                    try:
+                        self.send_json(200, {**read_learning_status(directory), "result": read_learning_result(directory)})
+                    except LearningError:
+                        self.send_json(500, {"error": "Local learning storage operation failed"})
+                    return
                 transcription_match = re.fullmatch(r"/captures/([0-9a-f-]{36})/transcription", self.path)
                 if transcription_match:
                     from capture_transcription import read_status, read_result
@@ -362,6 +438,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if self.reject_untrusted_request():
+            return
+        learning_match = re.fullmatch(r"/captures/([0-9a-f-]{36})/learning", self.path)
+        if learning_match:
+            try:
+                if not learning_enabled():
+                    self.send_json(409, {"error": "Capture learning is disabled"})
+                    return
+                if self.capture_json() != {}:
+                    raise CaptureError(400, "Expected an empty learning start request")
+                manifest = capture_store(DATA_DIR / "captures").get(learning_match[1])
+                if manifest["status"] == "aborted":
+                    raise CaptureError(409, "Interrupted captures require separate inspection")
+                wake_learning(DATA_DIR / "captures" / manifest["id"])
+                self.send_json(202, {"id": manifest["id"], "status": "scheduled"})
+            except CaptureError as error:
+                self.capture_error(error)
+            except Exception:
+                self.send_json(500, {"error": "Local learning scheduling failed"})
             return
         transcription_match = re.fullmatch(r"/captures/([0-9a-f-]{36})/transcription", self.path)
         if transcription_match:
