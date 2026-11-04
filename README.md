@@ -5,9 +5,9 @@ A Japanese video learning application for YouTube watch pages and Shorts, develo
 | Milestone | What it does | Local service |
 |---|---|---|
 | [Five-second capture test](#five-second-capture-test) | Capture five seconds of tab audio and obtain Japanese transcription with word timestamps | `127.0.0.1:8765` |
-| [Japanese learning application](app/README.md) | Record a whole video, transcribe it, optionally precompute Chinese translations, sentence explanations and kanji readings, then display the saved results alongside playback | `127.0.0.1:8766` |
+| [Japanese learning application](app/README.md) | Current capture stage: select a video range, upload acknowledged audio batches, verify local storage and replay the recording | `127.0.0.1:8766` |
 
-The application has been exercised on videos of approximately two minutes. The current 30-minute input limit does **not** mean long-video reliability has been validated.
+The current development stage is [batch capture](app/CAPTURE_ACCEPTANCE.md), verified with real 90-second and five-minute selections. Google/GPT processing is disabled by default for this stage. The previous whole-file processing code remains available for later integration; the current 30-minute selection limit does not mean long-video reliability has been validated.
 
 ## Project layout
 
@@ -15,8 +15,8 @@ The application has been exercised on videos of approximately two minutes. The c
 shorts-audio-capture-test/    Five-second Chrome Manifest V3 extension
 shorts-audio-capture-bridge/  Five-second local Python bridge and offline tests
 app/
-  extension/                Whole-video Chrome Manifest V3 extension
-  backend/                  Local transcription and optional learning-note service
+  extension/                Selected-range audio capture Chrome Manifest V3 extension
+  backend/                  Local capture storage, replay and existing processing modules
   README.md                 Setup, workflow, limitations and data retention
 ```
 
@@ -50,6 +50,7 @@ The repository provides application code, not access to the author's cloud accou
 
 - Google transcription requires **your own** Google Cloud project, billing, enabled Speech-to-Text API and Application Default Credentials (ADC). Set `GOOGLE_CLOUD_PROJECT` explicitly; the services use it for the recognizer and quota project. Your authenticated identity must have permission to use that project.
 - The five-second test makes **no OpenAI API calls**. The application calls OpenAI only when you enable learning-note generation and configure **your own** API key.
+- Current batch capture and offline replay need no Google or OpenAI credentials and make no cloud requests. The previous whole-file cloud route additionally requires the explicit `ENABLE_LEGACY_PIPELINE=1` setting.
 - Credentials stay in the local backend environment or a local ignored configuration file. The extension does not receive Google credentials or an OpenAI key.
 - Do not commit `.env` files, ADC files, service account keys, local result data, configured Python environments or SDK directories. Keep Google ADC in the normal Google Cloud CLI user configuration location, outside this repository.
 
@@ -98,4 +99,4 @@ These tests mock Google authentication and transcription, so they do not consume
 
 ## Japanese learning application
 
-Follow [the short-video setup guide](app/README.md). It includes optional OpenAI configuration, recording constraints, local cache behavior and data retention. Both services bind to loopback only and are intended for a personal computer, not public hosting.
+Follow [the application setup guide](app/README.md) and [capture acceptance checklist](app/CAPTURE_ACCEPTANCE.md). Both services bind to loopback only and are intended for a personal computer, not public hosting.

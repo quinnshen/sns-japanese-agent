@@ -1,11 +1,23 @@
 {
   "manifest_version": 3,
   "name": "SNS Japanese Agent",
-  "version": "0.2.1",
-  "description": "Transcribe Japanese YouTube videos and show precomputed Chinese translations and sentence analysis.",
+  "version": "0.3.2",
+  "description": "Capture a selected YouTube audio range in acknowledged batches and replay the locally saved recording.",
   "minimum_chrome_version": "116",
-  "permissions": ["activeTab", "offscreen", "scripting", "storage", "tabCapture"],
-  "host_permissions": ["http://127.0.0.1:8766/*"],
-  "action": { "default_title": "转写整段日语视频" },
-  "background": { "service_worker": "service-worker.js" }
+  "permissions": [
+    "activeTab",
+    "offscreen",
+    "scripting",
+    "storage",
+    "tabCapture"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8766/*"
+  ],
+  "action": {
+    "default_title": "采集所选日语视频音频"
+  },
+  "background": {
+    "service_worker": "service-worker.js"
+  }
 }

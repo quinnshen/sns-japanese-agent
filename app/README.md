@@ -1,10 +1,33 @@
 # SNS Japanese Agent
 
-A Chrome extension and local Python service that turn a Japanese YouTube video into a sentence timeline, synchronized Japanese/Chinese captions and precomputed learning notes. Click a sentence to seek; click its analysis button to reveal saved explanations without another model request.
+A Chrome extension and local Python service for Japanese video learning. The current development stage collects a selected YouTube audio range in acknowledged batches, saves the recording locally and provides private replay. See the [capture acceptance checklist](CAPTURE_ACCEPTANCE.md).
 
-This release preserves the current whole-video workflow. It has been exercised on short videos of approximately two minutes. Long-video reliability, incremental audio delivery and specified time ranges are not implemented in this milestone.
+The existing transcription and precomputed learning-note modules remain in the backend for later integration. They are not invoked by the new capture flow. Real 90-second and five-minute capture acceptance has passed; 30–40 minute validation follows end-to-end integration.
 
-## How it works
+## Current capture workflow
+
+```text
+Click extension on a YouTube watch or Shorts page
+  → Choose start/end video time and upload interval (default 5 seconds)
+  → Play the selected range at 1× and continuously record tab audio
+  → Upload numbered fragments with checksums and observed timing
+  → Save each fragment and its manifest, then acknowledge receipt
+  → Release each browser fragment after matching acknowledgement
+  → Flush the final fragment and confirm the complete sequence
+  → Verify and combine the continuous WebM recording
+  → Open private replay in an extension page
+```
+
+Uploads are fragments of one recording container; do not decode each fragment independently.
+An interrupted upload retains acknowledged batches locally. Unacknowledged browser data is
+kept in the failed session until the user explicitly releases it; cross-browser-restart recovery
+is outside this stage. Raw batches and combined audio remain in `app/data/captures/` until deleted.
+
+The first icon click prepares the tab audio stream so Chrome's short-lived stream permission
+can be consumed immediately. Recording starts only after you confirm the range. Cancel or
+close the panel to release it; the unconfirmed preparation expires after five minutes.
+
+## Existing processing modules (next integration stages)
 
 ```text
 User clicks extension on a YouTube watch or Shorts page
@@ -24,7 +47,7 @@ Original ASR text is retained separately from the annotated display text. The ba
 
 ## Setup
 
-Requires Chrome 116+, Python 3.11+ and your own Google Cloud project with billing and the Speech-to-Text API enabled. Follow the [repository's Google ADC setup](../README.md#common-prerequisites) first.
+Requires Chrome 116+ and Python 3.11+. Current capture and replay need no Google/OpenAI credentials. The [Google ADC setup](../README.md#common-prerequisites) is needed only when explicitly using cloud processing later.
 
 From the repository root:
 
@@ -36,21 +59,21 @@ cp .env.example .env.local
 chmod 600 .env.local
 ```
 
-Edit `.env.local` and replace `YOUR_PROJECT_ID` with **your own** project ID, then run `.venv/bin/python server.py`. The service listens only on `127.0.0.1:8766`. Google uses your local ADC identity and the explicitly configured project for transcription and quota. No author credentials or account quota are provided.
+Run `.venv/bin/python server.py`. The service listens only on `127.0.0.1:8766`. Keep `ENABLE_LEGACY_PIPELINE=0` during capture acceptance. You can skip copying `.env.example` for capture-only use; the cloud defaults are disabled.
 
 In Chrome:
 
 1. Open `chrome://extensions` and enable Developer mode.
 2. Choose **Load unpacked** and select only `app/extension/`.
 3. Open a Japanese YouTube watch or Shorts page and click the extension icon.
-4. Keep the tab open while it records from the beginning to the end at normal speed.
-5. After processing, click sentences to seek. With learning-note generation enabled, Chinese captions and expandable explanations are also available.
+4. Set start/end time and the upload interval in the panel, then choose **开始采集**.
+5. Keep the tab open at normal speed. When all batches are confirmed, choose **打开私有录音回放**.
 
 No microphone permission is required. The extension captures digital audio from the selected tab.
 
-## Optional Chinese translation and explanations
+## Existing cloud configuration (not used by capture)
 
-OpenAI processing is **off by default**. Japanese transcription works independently. To enable it, configure your own OpenAI API key on the computer running the backend.
+OpenAI processing is **off by default**. The current extension does not submit cloud work even if keys exist locally. The following settings are retained for the existing backend CLI modules and the explicitly enabled legacy route.
 
 From `app/backend/`:
 
@@ -60,7 +83,7 @@ From `app/backend/`:
 
 Paste your key at the hidden terminal prompt. The script updates `OPENAI_API_KEY` in `backend/.env.local` with owner-only permissions (`0600`) and preserves other settings. This local file is ignored by Git. Old one-line key files remain readable and are converted to `KEY=VALUE` when the configuration tool saves them.
 
-Set `ENABLE_ENRICHMENT=1` in `.env.local`, then restart the backend:
+For the previous whole-file `/jobs` route, both `ENABLE_LEGACY_PIPELINE=1` and `ENABLE_ENRICHMENT=1` are required to enable the automatic learning-note step. Keep the legacy route disabled during current capture acceptance. The new capture endpoints never invoke that step.
 
 ```sh
 .venv/bin/python server.py
@@ -78,7 +101,7 @@ Keep keys out of chat messages, extension files, source code and Git. The extens
 
 Results are saved under `app/data/<job-id>.json`. They include the source video URL, Japanese ASR text, word/sentence timestamps and any generated Chinese translations and analysis. They can reveal your viewing and learning history. Treat this directory as private local data; it is ignored by Git.
 
-Clicking the extension again on a previously processed video loads the most recent local result instead of recording and billing for the same video again. The panel's **↻** action forces a new recording and transcription. An already-open panel does not automatically refresh after a separate command changes a saved file; click the extension again to reload it.
+The current extension creates a new capture ID for each selected range; it does not reuse a whole-video transcript as the result of a different selection. The previous result JSON files remain available for explicit backend commands.
 
 To add or resume learning notes for a saved transcript without rerecording or calling Google, run from `app/backend/`:
 
@@ -98,10 +121,10 @@ Replace `./video.mov` with the path to your own media. This CLI produces transcr
 
 ## Current limits
 
-- Maximum video duration: 30 minutes. Maximum completed audio upload: 200 MB. These are input guards, not a guarantee of reliable long-video processing.
-- The full recording stays in browser memory until recording finishes. Transcription and analysis then run in sequence, so recording takes the video's playback time before cloud processing starts.
+- Maximum selected range: 30 minutes, including ranges inside longer source videos. Maximum stored audio: 200 MB; maximum individual upload: 10 MB. These are input guards, not a guarantee of reliable long-video processing.
+- Upload interval is configurable from 1 to 30 seconds, default 5 seconds. Browser memory retains unacknowledged fragments; their queue is bounded at 16 MiB. On failure, capture stops and pending data stays until the user releases it.
 - Playback must stay at 1× without seeking or pausing. Buffering longer than four seconds aborts recording. Shorter interruptions may still affect alignment; long-video synchronization has not been validated.
-- The service processes one transcription/analysis job at a time. There is no durable audio-chunk recovery workflow.
+- The extension supports one active capture at a time. Confirmed batches persist across backend restarts; automatic browser-session recovery and downstream task recovery are future stages.
 - Sentence boundaries are inferred from ASR punctuation and timing, not manually checked subtitles. Multiple speakers are not identified. Background noise, overlapping speech and colloquial speech may produce errors.
 - No OCR, screenshots, video understanding or speaker recognition is included. Explanations cannot reliably resolve visual references from audio alone.
 
@@ -109,7 +132,7 @@ Replace `./video.mov` with the path to your own media. This CLI produces transcr
 
 | Data | Destination and retention |
 |---|---|
-| Tab audio | Held in browser memory, then temporarily saved by the local backend and sent to Google for transcription |
+| Current tab audio | Unacknowledged fragments stay in browser memory; confirmed fragments and combined recording remain locally in `data/captures/`; not sent to cloud services |
 | Uploaded local audio | Deleted when the normal job finishes, including handled success and failure; forced termination may leave files in `data/uploads/` |
 | Converted audio slices | Decoded locally in memory for each transcription request; the application does not save separate WAV slice files |
 | Transcript and context text | Sent to OpenAI only when learning-note generation is enabled or explicitly run via CLI; video frames are not sent |
@@ -129,6 +152,16 @@ cd app
 backend/.venv/bin/python -m unittest discover -s backend -p 'test_*.py' -v
 ```
 
-The tests use mock cloud responses and do not require real credentials or consume cloud quota. `GET http://127.0.0.1:8766/health` reports whether the project, learning-note feature and API key are configured, without returning credential values.
+The tests use mock cloud responses and do not require real credentials or consume cloud quota. `GET http://127.0.0.1:8766/health` reports capture capability and whether the legacy cloud route is enabled, without reading or returning API key values.
+
+From the repository root, run the extension's offline contract and lifecycle checks with Node.js:
+
+```sh
+node scripts/test_capture_extension.mjs
+node scripts/test_capture_page.mjs
+node scripts/test_capture_worker.mjs
+```
+
+These checks use synthetic media, a simulated DOM and mocked Chrome APIs; real-browser capture acceptance remains separate.
 
 The extension requests `activeTab`, `tabCapture`, `offscreen`, `scripting`, `storage` and access to `http://127.0.0.1:8766/*` for capture, page display, task state and communication with the local service. It contains no public cloud endpoint or account credentials.

@@ -6,11 +6,13 @@ import json
 import re
 import threading
 import uuid
+from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from config import setting
+from capture_store import CaptureError, CaptureStore
 from pipeline import MAX_DURATION_SECONDS, save_result, transcribe_media
 from enrich import enrich_result, local_api_key
 
@@ -20,6 +22,11 @@ MAX_UPLOAD_BYTES = 200_000_000
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 jobs: dict[str, dict] = {}
 jobs_lock = threading.Lock()
+
+
+@lru_cache(maxsize=8)
+def capture_store(root: Path) -> CaptureStore:
+    return CaptureStore(root)
 
 
 def trusted_request_source(host: str, origin: str) -> bool:
@@ -107,7 +114,9 @@ class Handler(BaseHTTPRequestHandler):
         self.log_message("%s %s %s", self.command, urlparse(self.path).path, str(code))
 
     def reject_untrusted_request(self) -> bool:
-        if not trusted_request_source(self.headers.get("Host", ""), self.headers.get("Origin", "")):
+        origin = self.headers.get("Origin", "")
+        cross_site_without_origin = not origin and self.headers.get("Sec-Fetch-Site") == "cross-site"
+        if cross_site_without_origin or not trusted_request_source(self.headers.get("Host", ""), origin):
             self.send_json(403, {"error": "Local extension requests only"})
             return True
         return False
@@ -117,12 +126,141 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         origin = self.headers.get("Origin", "")
         if origin.startswith("chrome-extension://"):
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
         self.end_headers()
         self.wfile.write(body)
+
+    def capture_json(self) -> dict:
+        if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
+            raise CaptureError(415, "Expected JSON request")
+        length = self.body_length(256_000)
+        try:
+            payload = json.loads(self.read_body(length))
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            raise CaptureError(400, "Invalid JSON request") from None
+        if not isinstance(payload, dict):
+            raise CaptureError(400, "Expected JSON object")
+        return payload
+
+    def body_length(self, maximum: int) -> int:
+        if self.headers.get("Transfer-Encoding"):
+            raise CaptureError(400, "Transfer-Encoding is not supported")
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            raise CaptureError(411, "Content-Length required") from None
+        if not 0 < length <= maximum:
+            raise CaptureError(413, "Request body exceeds limit or is empty")
+        return length
+
+    def read_body(self, length: int) -> bytes:
+        body = self.rfile.read(length)
+        if len(body) != length:
+            raise CaptureError(400, "Incomplete request body")
+        return body
+
+    def capture_error(self, error: CaptureError) -> None:
+        self.send_json(error.status, {"error": error.error, **error.details})
+
+    def capture_post(self) -> None:
+        try:
+            payload = self.capture_json()
+            store = capture_store(DATA_DIR / "captures")
+            if self.path == "/captures":
+                self.send_json(200, store.create(payload))
+                return
+            match = re.fullmatch(r"/captures/([0-9a-f-]{36})/(timing|complete|abort)", self.path)
+            if not match:
+                raise CaptureError(404, "Capture route not found")
+            capture_id, action = match.groups()
+            operation = {"timing": store.set_timing, "complete": store.complete}
+            result = store.abort(capture_id, payload) if action == "abort" else operation[action](capture_id, payload)
+            self.send_json(200, result)
+        except CaptureError as error:
+            self.capture_error(error)
+        except (OSError, ValueError, TypeError, KeyError):
+            self.send_json(500, {"error": "Local capture storage operation failed"})
+
+    def capture_audio(self, capture_id: str) -> None:
+        store = capture_store(DATA_DIR / "captures")
+        path = store.audio_path(capture_id)
+        size = path.stat().st_size
+        start, end, status = 0, size - 1, 200
+        requested = self.headers.get("Range")
+        if requested:
+            match = re.fullmatch(r"bytes=(\d{0,20})-(\d{0,20})", requested)
+            if not match or not any(match.groups()):
+                self.send_json(416, {"error": "Unsupported byte range"})
+                return
+            first, last = match.groups()
+            if first:
+                start = int(first)
+                end = min(int(last), end) if last else end
+            else:
+                start = max(0, size - int(last))
+            if not 0 <= start <= end < size:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            status = 206
+        with path.open("rb") as source:
+            source.seek(start)
+            self.send_response(status)
+            self.send_header("Content-Type", "audio/webm")
+            self.send_header("Content-Length", str(end - start + 1))
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            origin = self.headers.get("Origin", "")
+            if re.fullmatch(r"chrome-extension://[a-p]{32}", origin):
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Vary", "Origin")
+            if status == 206:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.end_headers()
+            remaining = end - start + 1
+            while remaining:
+                block = source.read(min(64 * 1024, remaining))
+                if not block:
+                    break
+                self.wfile.write(block)
+                remaining -= len(block)
+
+    def do_PUT(self) -> None:
+        if self.reject_untrusted_request():
+            return
+        try:
+            match = re.fullmatch(r"/captures/([0-9a-f-]{36})/batches/(\d{1,5})", self.path)
+            if not match:
+                raise CaptureError(404, "Capture batch route not found")
+            mime = self.headers.get("Content-Type", "").replace(" ", "").lower()
+            if mime not in {"audio/webm", "audio/webm;codecs=opus"}:
+                raise CaptureError(415, "Expected WebM audio")
+            length = self.body_length(10_000_000)
+            try:
+                metadata = {
+                    "sha256": self.headers.get("X-Batch-SHA256", ""),
+                    "capture_start_ms": float(self.headers.get("X-Capture-Start-Ms", "")),
+                    "capture_end_ms": float(self.headers.get("X-Capture-End-Ms", "")),
+                }
+                if self.headers.get("X-Blob-Timecode-Ms") is not None:
+                    metadata["blob_timecode_ms"] = float(self.headers["X-Blob-Timecode-Ms"])
+            except ValueError:
+                raise CaptureError(400, "Invalid batch timing headers") from None
+            store = capture_store(DATA_DIR / "captures")
+            result = store.put_batch(match[1], int(match[2]), self.read_body(length), metadata)
+            self.send_json(200, result)
+        except CaptureError as error:
+            self.capture_error(error)
+        except (OSError, ValueError, TypeError, KeyError):
+            self.send_json(500, {"error": "Local capture storage operation failed"})
 
     def do_OPTIONS(self) -> None:
         if self.reject_untrusted_request():
@@ -133,10 +271,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", origin)
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
         self.send_header(
             "Access-Control-Allow-Headers",
-            "Content-Type, X-Japanese-Agent, X-Video-Duration-Sec, X-Capture-Offset-Sec, X-Source-Url",
+            "Content-Type, X-Japanese-Agent, X-Video-Duration-Sec, X-Capture-Offset-Sec, X-Source-Url, "
+            "X-Batch-SHA256, X-Capture-Start-Ms, X-Capture-End-Ms, X-Blob-Timecode-Ms",
         )
         self.send_header("Vary", "Origin")
         self.end_headers()
@@ -147,10 +286,27 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self.send_json(200, {
                 "ok": True,
-                "project_configured": bool(setting("GOOGLE_CLOUD_PROJECT")),
-                "enrichment_enabled": setting("ENABLE_ENRICHMENT") == "1",
-                "enrichment_key_configured": bool(local_api_key()),
+                "capabilities": {
+                    "capture_batches": True,
+                    "cloud_processing": setting("ENABLE_LEGACY_PIPELINE", "0") == "1",
+                },
             })
+            return
+        if self.path.startswith("/captures/"):
+            try:
+                match = re.fullmatch(r"/captures/([0-9a-f-]{36})(/audio)?", self.path)
+                if not match:
+                    raise CaptureError(404, "Capture route not found")
+                if match[2]:
+                    self.capture_audio(match[1])
+                else:
+                    self.send_json(200, capture_store(DATA_DIR / "captures").get(match[1]))
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except CaptureError as error:
+                self.capture_error(error)
+            except (OSError, ValueError, TypeError, KeyError):
+                self.send_json(500, {"error": "Local capture storage operation failed"})
             return
         parsed_path = urlparse(self.path)
         if parsed_path.path == "/results":
@@ -173,8 +329,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if self.reject_untrusted_request():
             return
+        if self.path == "/captures" or self.path.startswith("/captures/"):
+            self.capture_post()
+            return
         if self.path != "/jobs":
             self.send_json(404, {"error": "Not found"})
+            return
+        if setting("ENABLE_LEGACY_PIPELINE", "0") != "1":
+            self.send_json(409, {"error": "Cloud processing is disabled during capture acceptance"})
             return
         if self.headers.get("X-Japanese-Agent") != "full-video-v1":
             self.send_json(403, {"error": "Extension request required"})
@@ -229,6 +391,5 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    configured = bool(setting("GOOGLE_CLOUD_PROJECT", "").strip())
-    print(f"Listening on http://{HOST}:{PORT}; Google project configured: {configured}")
+    print(f"Listening on http://{HOST}:{PORT}; local batch capture ready")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
