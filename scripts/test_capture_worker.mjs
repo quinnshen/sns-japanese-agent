@@ -7,8 +7,8 @@ const recorderSource = await readFile(new URL("../app/extension/offscreen.js", i
 const extensionId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const origin = `chrome-extension://${extensionId}/`;
 const videoUrl = "https://www.youtube.com/watch?v=AbCdEf012_-";
-const tab = { id: 7, url: videoUrl };
-const pageMetadata = { ok: true, version: "0.5.2", protocol: 1 };
+const tab = { id: 7, url: videoUrl, active: true };
+const pageMetadata = { ok: true, version: "0.5.4", protocol: 1 };
 const tick = async () => { for (let i = 0; i < 120; i++) await Promise.resolve(); };
 async function until(check) { for (let i = 0; i < 20; i++) { if (check()) return; await tick(); } assert.ok(check(), "Lifecycle did not reach expected state"); }
 function deferred() { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; }
@@ -23,12 +23,15 @@ function clock() {
 function workerHarness({ initial, documentExists = false, inspect = { ok: true, phase: "ready" }, streamId, stallAbort = false,
   transcriptionEnabled = false, transcriptionReply = {}, injectionResults = [{ frameId: 0, result: pageMetadata }],
   handshakeReply = pageMetadata, statusUnavailable = false, enrichmentEnabled = false,
-  learningReply = {}, latestLearningReply = learningReply, currentTabUrl = videoUrl } = {}) {
+  learningReply = {}, latestLearningReply = learningReply, currentTabUrl = videoUrl,
+  currentTabActive = true, currentTabId = tab.id, closeDocument, configuringReply = { ok: true } } = {}) {
   const timer = clock(); let action; let listener; let stored = initial; let contexts = documentExists;
+  let pageSessionId;
   let serial = 0; let closeCount = 0; let streamCalls = 0; let createCount = 0; let contextCalls = 0;
   const pageMessages = []; const offscreenMessages = []; const fetches = [];
   const injections = []; const badges = []; const titles = []; const lifecycle = []; const pageTargets = [];
   const fetchOptions = [];
+  const streamArguments = []; const tabGets = [];
   const chrome = {
     action: { onClicked: { addListener(fn) { action = fn; } },
       async setBadgeText(value) { badges.push(structuredClone(value)); }, async setBadgeBackgroundColor() {},
@@ -39,7 +42,7 @@ function workerHarness({ initial, documentExists = false, inspect = { ok: true, 
       onMessage: { addListener(fn) { listener = fn; } },
       async sendMessage(message) {
         offscreenMessages.push(structuredClone(message));
-        if (message.type === "capture-inspect") return inspect;
+        if (message.type === "capture-inspect") return typeof inspect === "function" ? inspect() : inspect;
         if (message.type === "capture-abort" && stallAbort) return new Promise(() => {});
         return { ok: true };
       },
@@ -53,15 +56,19 @@ function workerHarness({ initial, documentExists = false, inspect = { ok: true, 
       lifecycle.push("inject"); injections.push(structuredClone(value));
       return typeof injectionResults === "function" ? injectionResults() : structuredClone(injectionResults);
     } },
-    offscreen: { async createDocument() { lifecycle.push("create-offscreen"); contexts = true; createCount++; }, async closeDocument() { contexts = false; closeCount++; } },
-    tabCapture: { async getMediaStreamId() { lifecycle.push("stream"); streamCalls++; return streamId ? streamId(streamCalls) : "synthetic-stream"; } },
+    offscreen: { async createDocument() { lifecycle.push("create-offscreen"); contexts = true; createCount++; }, async closeDocument() { closeCount++; if (closeDocument) await closeDocument(); contexts = false; } },
+    tabCapture: { async getMediaStreamId(options) { lifecycle.push("stream"); streamCalls++; streamArguments.push(structuredClone(options)); return streamId ? streamId(streamCalls) : "synthetic-stream"; } },
     tabs: {
-      async get() { return { ...tab, url: currentTabUrl }; }, async create() {}, onRemoved: { addListener() {} },
+      async get(id) { tabGets.push(id); return { ...tab, id: currentTabId, url: currentTabUrl, active: currentTabActive }; }, async create() {}, onRemoved: { addListener() {} },
       async sendMessage(tabId, message, options) {
         pageMessages.push(structuredClone(message)); pageTargets.push({ tabId, options: structuredClone(options) });
+        if (["capture-configuring", "capture-recovery"].includes(message.type)) pageSessionId = message.sessionId;
         if (message.type === "page-handshake") {
           lifecycle.push("handshake");
           return typeof handshakeReply === "function" ? handshakeReply() : structuredClone(handshakeReply);
+        }
+        if (message.type === "capture-configuring") {
+          return typeof configuringReply === "function" ? configuringReply() : structuredClone(configuringReply);
         }
         if (statusUnavailable && message.type === "status") throw new Error("Receiving end does not exist.");
         return { ok: true };
@@ -82,8 +89,9 @@ function workerHarness({ initial, documentExists = false, inspect = { ok: true, 
     },
   });
   vm.runInContext(workerSource, context);
-  return { timer, pageMessages, offscreenMessages, fetches, fetchOptions, injections, badges, titles, lifecycle, pageTargets,
-    click: () => action(tab), get stored() { return stored; }, get closeCount() { return closeCount; }, get streamCalls() { return streamCalls; },
+  return { timer, pageMessages, offscreenMessages, fetches, fetchOptions, injections, badges, titles, lifecycle, pageTargets, streamArguments, tabGets,
+    click: (clickedTab = tab) => action(clickedTab), get stored() { return stored; }, get closeCount() { return closeCount; }, get streamCalls() { return streamCalls; },
+    get pageSessionId() { return pageSessionId; },
     get createCount() { return createCount; }, get contextCalls() { return contextCalls; },
     message: (payload, senderOverride = {}) => new Promise((resolve) => { listener({ target: "worker", ...payload }, { id: extensionId, tab, frameId: 0, ...senderOverride }, resolve); }),
   };
@@ -99,7 +107,7 @@ function workerHarness({ initial, documentExists = false, inspect = { ok: true, 
   h.timer.fire(3000); await tick();
   assert.equal(h.stored, undefined, "Timed-out preparation must not lock the next extension action");
   assert.equal(h.closeCount, 1);
-  h.click(); await tick();
+  h.click(); await until(() => h.stored?.phase === "ready");
   assert.equal(h.stored.phase, "ready");
   assert.equal(h.streamCalls, 2);
   assert.ok(h.pageMessages.some((m) => m.type === "status" && /超时/.test(m.text)));
@@ -108,7 +116,7 @@ function workerHarness({ initial, documentExists = false, inspect = { ok: true, 
 {
   const previous = { tabId: tab.id, sourceUrl: videoUrl, sessionId: "00000000-0000-4000-8000-000000000099", phase: "preparing" };
   const h = workerHarness({ initial: previous });
-  h.click(); await tick();
+  h.click(); await until(() => h.stored?.phase === "ready");
   assert.equal(h.stored.phase, "ready");
   assert.notEqual(h.stored.sessionId, previous.sessionId);
   assert.equal(h.streamCalls, 1);
@@ -116,17 +124,32 @@ function workerHarness({ initial, documentExists = false, inspect = { ok: true, 
 }
 {
   const previous = { tabId: tab.id, sourceUrl: videoUrl, sessionId: "00000000-0000-4000-8000-000000000099", phase: "failed" };
-  const h = workerHarness({ initial: previous, documentExists: true, inspect: { ok: true, phase: "failed", pendingBatches: 5, pendingBytes: 1000 } });
-  h.click(); await tick();
-  assert.equal(h.stored.sessionId, previous.sessionId);
-  assert.equal(h.closeCount, 0);
-  assert.equal(h.streamCalls, 0);
-  assert.equal(h.offscreenMessages.some((m) => m.type === "capture-abort"), false);
-  assert.ok(h.pageMessages.some((m) => m.type === "capture-failed"));
-  assert.equal((await h.message({ type: "capture-cancel", sessionId: previous.sessionId })).ok, true);
-  assert.equal(h.closeCount, 1);
-  assert.equal(h.stored, undefined);
-  console.log("PASS failed unacknowledged queue survives repeated action until explicit cancellation");
+  for (const pendingBatches of [0, 5]) {
+    const h = workerHarness({ initial: previous, documentExists: true, inspect: { ok: true, phase: "failed", pendingBatches, pendingBytes: pendingBatches * 200 } });
+    assert.equal(h.pageSessionId, undefined, "A fresh page initially has no old task binding");
+    h.click(); await tick();
+    h.click(); await tick();
+    assert.equal(h.stored.sessionId, previous.sessionId);
+    assert.equal(h.closeCount, 0);
+    assert.equal(h.streamCalls, 0);
+    assert.equal(h.offscreenMessages.some((m) => m.type === "capture-abort"), false);
+    const restored = h.pageMessages.filter((m) => m.type === "capture-recovery");
+    assert.equal(restored.length, 2);
+    assert.equal(restored[0].sessionId, previous.sessionId);
+    assert.equal(restored[0].recoveryState, "failed");
+    assert.equal(restored[0].pendingBatches, pendingBatches);
+    assert.equal("sourceUrl" in restored[0], false);
+    assert.equal(h.pageSessionId, previous.sessionId);
+    assert.equal(h.pageMessages.some((m) => m.type === "capture-configure"), false);
+    if (!pendingBatches) assert.match(h.titles.at(-1).title, /没有待确认批次/);
+    assert.equal((await h.message({ type: "capture-cancel", sessionId: h.pageSessionId })).ok, true);
+    assert.equal(h.closeCount, 1);
+    assert.equal(h.stored, undefined);
+    h.click(); await until(() => h.stored?.phase === "ready");
+    assert.notEqual(h.stored.sessionId, previous.sessionId);
+    assert.equal(h.streamCalls, 1);
+  }
+  console.log("PASS failed queues including zero pending batches bind recovery controls until explicit cancellation, then permit a fresh preparation");
 }
 {
   const previous = { tabId: tab.id, sourceUrl: videoUrl, sessionId: "00000000-0000-4000-8000-000000000099", phase: "preparing" };
@@ -486,4 +509,293 @@ function readySentence(overrides = {}) {
   assert.deepEqual(h.fetches.map((url) => new URL(url).pathname), ["/health"]);
   console.log("PASS new-capture GPT mode requires Google ASR while saved learning remains independently readable");
 }
-console.log("26 preparation, handshake, learning, diagnostic, status, and failure lifecycle checks passed.");
+{
+  const previous = { tabId: tab.id, sourceUrl: videoUrl, sessionId: "00000000-0000-4000-8000-000000000099", phase: "preparing" };
+  for (const inspect of [{ ok: false }, () => undefined,
+    { ok: true, phase: "unexpected", pendingBatches: 2, pendingBytes: 300 },
+    () => { throw new Error("synthetic-private-marker"); },
+  ]) {
+    const h = workerHarness({ initial: previous, documentExists: true, inspect });
+    h.click(); await tick();
+    const recovery = h.pageMessages.find((message) => message.type === "capture-recovery");
+    assert.equal(recovery.recoveryState, "unknown");
+    assert.equal(h.pageSessionId, previous.sessionId);
+    assert.equal(h.stored.sessionId, previous.sessionId);
+    assert.equal(h.closeCount, 0);
+    assert.equal(h.streamCalls, 0);
+    assert.equal(h.fetches.length, 0);
+    assert.equal(h.offscreenMessages.some((message) => ["capture-abort", "capture-arm", "capture-start"].includes(message.type)), false);
+    assert.equal(h.pageMessages.some((message) => message.type === "capture-configure"), false);
+    assert.equal(JSON.stringify(h.titles).includes("synthetic-private-marker"), false);
+  }
+  console.log("PASS unknown or failed inspection binds safe release controls without discarding data or exposing raw errors");
+}
+{
+  const pending = deferred();
+  const previous = { tabId: tab.id, sourceUrl: videoUrl, sessionId: "00000000-0000-4000-8000-000000000099", phase: "preparing" };
+  const h = workerHarness({ initial: previous, documentExists: true, inspect: () => pending.promise });
+  h.click(); await until(() => h.offscreenMessages.some((message) => message.type === "capture-inspect"));
+  h.timer.fire(3000); await tick();
+  assert.equal(h.pageSessionId, previous.sessionId);
+  const recovery = h.pageMessages.find((message) => message.type === "capture-recovery");
+  assert.equal(recovery.recoveryState, "unknown");
+  assert.equal(recovery.pendingBatches, null);
+  assert.equal(recovery.pendingBytes, null);
+  pending.resolve({ ok: true, phase: "ready" }); await tick();
+  assert.equal(h.closeCount, 0);
+  assert.equal(h.streamCalls, 0);
+  assert.equal(h.pageMessages.some((message) => message.type === "capture-configure"), false);
+  assert.equal(h.offscreenMessages.some((message) => message.type === "capture-abort"), false);
+  console.log("PASS inspection timeout exposes recovery-only controls and ignores a late ready response");
+}
+{
+  for (const phase of ["recording", "saving"]) {
+    const previous = { tabId: tab.id, sourceUrl: videoUrl, sessionId: "00000000-0000-4000-8000-000000000099", phase };
+    const h = workerHarness({ initial: previous, documentExists: true, inspect: { ok: true, phase, pendingBatches: 2, pendingBytes: 300 } });
+    h.click(); await tick();
+    const recovery = h.pageMessages.find((message) => message.type === "capture-recovery");
+    assert.equal(recovery.recoveryState, phase);
+    assert.equal(h.pageSessionId, previous.sessionId);
+    assert.equal(h.stored.phase, phase);
+    assert.equal(h.closeCount, 0);
+    assert.equal(h.streamCalls, 0);
+    assert.equal(h.pageMessages.some((message) => ["capture-configuring", "capture-configure", "prepare", "play"].includes(message.type)), false);
+    assert.equal(h.offscreenMessages.some((message) => ["capture-abort", "capture-arm", "capture-start"].includes(message.type)), false);
+    assert.equal((await h.message({ type: "capture-cancel", sessionId: h.pageSessionId })).ok, true);
+    assert.equal(h.closeCount, 1);
+  }
+  console.log("PASS fresh-page recovery binds cancellation for recording or saving without restarting or interrupting live work");
+}
+{
+  const changedTab = { id: tab.id, url: "https://www.youtube.com/watch?v=ZyXwVu987_-" };
+  const previous = { tabId: tab.id, sourceUrl: videoUrl, sessionId: "00000000-0000-4000-8000-000000000099", phase: "ready" };
+  const h = workerHarness({ initial: previous, documentExists: true, currentTabUrl: changedTab.url,
+    inspect: { ok: true, phase: "ready", pendingBatches: 0, pendingBytes: 0 } });
+  h.click(changedTab); await tick();
+  assert.equal(h.pageMessages.find((message) => message.type === "capture-recovery").recoveryState, "source_changed");
+  assert.equal(h.stored.sourceUrl, videoUrl);
+  assert.equal(h.streamCalls, 0);
+  assert.equal(h.closeCount, 0);
+  assert.equal(h.pageMessages.some((message) => message.type === "capture-configure"), false);
+  await h.message({ type: "capture-cancel", sessionId: h.pageSessionId });
+  h.click(changedTab); await until(() => h.stored?.phase === "ready");
+  assert.equal(h.stored.sourceUrl, changedTab.url);
+  assert.notEqual(h.stored.sessionId, previous.sessionId);
+  assert.equal(h.streamCalls, 1);
+  assert.equal(h.offscreenMessages.some((message) => message.type === "capture-start"), false);
+  console.log("PASS a changed video cannot reuse stale preparation and can rearm only after explicit release");
+}
+{
+  const previous = { tabId: tab.id, sourceUrl: videoUrl, sessionId: "00000000-0000-4000-8000-000000000099", phase: "failed" };
+  const h = workerHarness({ initial: previous, documentExists: true });
+  assert.equal((await h.message({ type: "capture-cancel", sessionId: previous.sessionId })).ok, true);
+  const reply = await h.message({ type: "capture-rearm", requestId: 1, tabId: 999, sessionId: previous.sessionId }, { url: videoUrl });
+  assert.equal(reply.ok, true);
+  assert.equal(reply.sessionId, h.stored.sessionId);
+  assert.notEqual(reply.sessionId, previous.sessionId);
+  assert.equal(h.stored.phase, "ready");
+  assert.equal(h.createCount, 1);
+  assert.equal(h.streamCalls, 1);
+  assert.deepEqual(h.streamArguments, [{ targetTabId: tab.id }], "A payload cannot override the verified sender tab");
+  assert.equal(h.pageMessages.some((message) => ["prepare", "play"].includes(message.type)), false);
+  assert.equal(h.offscreenMessages.some((message) => message.type === "capture-start"), false);
+  assert.deepEqual(h.fetches.map((url) => new URL(url).pathname), ["/health"]);
+  assert.equal(h.fetchOptions.every((options) => options.method === "GET"), true);
+  console.log("PASS explicit release permits direct panel rearm with a fresh ID and audio preparation only");
+}
+{
+  for (const phase of ["preparing", "ready", "recording", "saving", "failed"]) {
+    const previous = { tabId: tab.id, sourceUrl: videoUrl, sessionId: "00000000-0000-4000-8000-000000000099", phase };
+    const h = workerHarness({ initial: previous, documentExists: true });
+    const reply = await h.message({ type: "capture-rearm", requestId: 1 }, { url: videoUrl });
+    assert.equal(reply.ok, false);
+    assert.match(reply.error, /已有采集任务/);
+    assert.deepEqual(h.stored, previous);
+    assert.equal(h.offscreenMessages.length, 0);
+    assert.equal(h.contextCalls, 0);
+    assert.equal(h.streamCalls, 0);
+    assert.equal(h.closeCount, 0);
+    assert.equal(h.fetches.length, 0);
+  }
+  console.log("PASS panel rearm never inspects, replaces, or releases an existing capture in any phase");
+}
+{
+  const h = workerHarness();
+  for (const sender of [
+    { id: "untrusted-extension", url: videoUrl }, { frameId: 1, url: videoUrl },
+    { tab: undefined, url: videoUrl }, { tab: { id: 0 }, url: videoUrl },
+    { tab: { id: -1 }, url: videoUrl }, { tab: { id: 7.5 }, url: videoUrl },
+    { tab: { id: "7" }, url: videoUrl }, {}, { url: "https://example.invalid" },
+  ]) assert.equal((await h.message({ type: "capture-rearm", requestId: 1, tabId: tab.id }, sender)).ok, false);
+  assert.equal(h.tabGets.length, 0);
+  assert.equal(h.injections.length, 0);
+  assert.equal(h.fetches.length, 0);
+  assert.equal(h.offscreenMessages.length, 0);
+  assert.equal(h.stored, undefined);
+  console.log("PASS direct rearm rejects foreign, subframe, missing-URL, and malformed-tab senders before any setup");
+}
+{
+  for (const options of [
+    { currentTabUrl: "https://www.youtube.com/watch?v=ZyXwVu987_-" },
+    { currentTabUrl: "https://example.invalid" }, { currentTabActive: false }, { currentTabId: 8 },
+  ]) {
+    const h = workerHarness(options);
+    const reply = await h.message({ type: "capture-rearm", requestId: 1 }, { url: videoUrl });
+    assert.equal(reply.ok, false);
+    assert.match(reply.error, /请点击浏览器工具栏 S 重新连接音频/);
+    assert.deepEqual(h.tabGets, [tab.id]);
+    assert.equal(h.injections.length, 0);
+    assert.equal(h.fetches.length, 0);
+    assert.equal(h.streamCalls, 0);
+    assert.equal(h.offscreenMessages.length, 0);
+    assert.equal(h.stored, undefined);
+  }
+  console.log("PASS rearm verifies the active current tab and exact sender URL before page or audio setup");
+}
+{
+  for (const first of ["panel", "toolbar"]) {
+    const handshake = deferred();
+    const h = workerHarness({ handshakeReply: () => handshake.promise });
+    const initial = first === "panel" ? h.message({ type: "capture-rearm", requestId: 1 }, { url: videoUrl }) : (h.click(), null);
+    await until(() => h.pageMessages.some((message) => message.type === "page-handshake"));
+    const duplicate = await h.message({ type: "capture-rearm", requestId: 1 }, { url: videoUrl });
+    assert.equal(duplicate.ok, false);
+    assert.equal(duplicate.error, "正在连接音频，请稍候后重试。");
+    h.click(); await tick();
+    assert.equal(h.injections.length, 1);
+    handshake.resolve(pageMetadata);
+    if (initial) assert.equal((await initial).ok, true);
+    await until(() => h.pageMessages.some((message) => message.type === "capture-configure"));
+    assert.equal(h.createCount, 1);
+    assert.equal(h.streamCalls, 1);
+    assert.equal(h.pageMessages.filter((message) => message.type === "capture-configure").length, 1);
+  }
+  console.log("PASS toolbar and panel openings share one lock and duplicate panel requests receive a fixed busy reply");
+}
+{
+  const closing = deferred();
+  const previous = { tabId: tab.id, sourceUrl: videoUrl, sessionId: "00000000-0000-4000-8000-000000000099", phase: "failed" };
+  const h = workerHarness({ initial: previous, documentExists: true, closeDocument: () => closing.promise });
+  const cancelled = h.message({ type: "capture-cancel", sessionId: previous.sessionId });
+  await until(() => h.closeCount === 1);
+  assert.ok(h.pageMessages.some((message) => message.type === "capture-reset"));
+  const rearmed = h.message({ type: "capture-rearm", requestId: 1 }, { url: videoUrl });
+  await tick();
+  const duplicate = await h.message({ type: "capture-rearm", requestId: 1 }, { url: videoUrl });
+  assert.equal(duplicate.ok, false);
+  assert.equal(duplicate.error, "正在连接音频，请稍候后重试。");
+  h.click(); await tick();
+  assert.equal(h.createCount, 0);
+  assert.equal(h.streamCalls, 0);
+  assert.equal(h.fetches.length, 0);
+  closing.resolve();
+  assert.equal((await cancelled).ok, true);
+  assert.equal((await rearmed).ok, true);
+  assert.equal(h.stored.phase, "ready");
+  assert.notEqual(h.stored.sessionId, previous.sessionId);
+  assert.equal(h.createCount, 1);
+  assert.equal(h.streamCalls, 1);
+  assert.match(h.titles.at(-1).title, /选择采集范围/);
+  console.log("PASS rearm after reset waits for old document closure and cannot create a stream during release");
+}
+{
+  const h = workerHarness({ streamId: (attempt) => {
+    if (attempt === 1) throw new Error("synthetic-private-marker: tab capture permission denied");
+    return "toolbar-retry-stream";
+  } });
+  const reply = await h.message({ type: "capture-rearm", requestId: 1 }, { url: videoUrl });
+  assert.equal(reply.ok, false);
+  assert.equal(reply.error, "音频未重新连接，请点击浏览器工具栏 S 重新连接音频。");
+  assert.equal(JSON.stringify(reply).includes("synthetic-private-marker"), false);
+  assert.equal(JSON.stringify(h.titles).includes("synthetic-private-marker"), false);
+  assert.equal(h.stored, undefined);
+  assert.equal(h.closeCount, 1);
+  assert.equal(h.offscreenMessages.filter((message) => message.type === "capture-abort").length, 1);
+  assert.equal(h.offscreenMessages.some((message) => ["capture-arm", "capture-start"].includes(message.type)), false);
+  assert.equal(h.pageMessages.some((message) => ["prepare", "play"].includes(message.type)), false);
+  h.click(); await until(() => h.stored?.phase === "ready");
+  assert.equal(h.streamCalls, 2);
+  assert.equal(h.stored.phase, "ready");
+  console.log("PASS denied panel capture permission returns a fixed toolbar fallback and releases failed preparation");
+}
+{
+  const closing = deferred();
+  const previous = { tabId: tab.id, sourceUrl: videoUrl, sessionId: "00000000-0000-4000-8000-000000000099", phase: "failed" };
+  const h = workerHarness({ initial: previous, documentExists: true, closeDocument: () => closing.promise });
+  const cancelled = h.message({ type: "capture-cancel", sessionId: previous.sessionId });
+  await until(() => h.closeCount === 1);
+  h.timer.fire(3000); await tick();
+  assert.equal((await cancelled).ok, true, "A stuck Chrome close must not hang the cancellation controls");
+  const rearmed = h.message({ type: "capture-rearm", requestId: 1 }, { url: videoUrl });
+  await tick(); h.timer.fire(4000); await tick();
+  const reply = await rearmed;
+  assert.equal(reply.ok, false);
+  assert.match(reply.error, /请点击浏览器工具栏 S 重新连接音频/);
+  assert.equal(h.createCount, 0);
+  assert.equal(h.streamCalls, 0);
+  assert.equal(h.fetches.length, 0);
+  closing.resolve(); await tick();
+  assert.equal(h.createCount, 0, "A late close cannot restart the expired rearm request");
+  assert.equal((await h.message({ type: "capture-rearm", requestId: 1 }, { url: videoUrl })).ok, true);
+  assert.equal(h.createCount, 1);
+  assert.equal(h.streamCalls, 1);
+  console.log("PASS timed-out old closure keeps rearm fail-closed until Chrome actually settles, without late automatic retry");
+}
+{
+  const h = workerHarness();
+  for (const requestId of [undefined, null, "1", 0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 1_000_000_001]) {
+    assert.equal((await h.message({ type: "capture-rearm", requestId }, { url: videoUrl })).ok, false);
+  }
+  assert.equal(h.tabGets.length, 0);
+  assert.equal(h.injections.length, 0);
+  assert.equal(h.fetches.length, 0);
+  assert.equal(h.offscreenMessages.length, 0);
+  console.log("PASS rearm requires a bounded positive integer request ID before any page, local, or audio work");
+}
+{
+  const h = workerHarness();
+  assert.equal((await h.message({ type: "capture-rearm", requestId: 27 }, { url: videoUrl })).ok, true);
+  const tagged = h.pageMessages.filter((message) => ["status", "capture-configuring", "capture-configure"].includes(message.type));
+  assert.ok(tagged.length > 5);
+  assert.equal(tagged.every((message) => message.rearmRequestId === 27), true);
+  assert.equal(h.offscreenMessages.some((message) => "rearmRequestId" in message), false,
+    "A UI request ID must not enter the recorder session or uploaded task");
+  assert.equal("rearmRequestId" in h.stored, false);
+  const toolbar = workerHarness();
+  toolbar.click(); await until(() => toolbar.pageMessages.some((message) => message.type === "capture-configure"));
+  assert.equal(toolbar.pageMessages.some((message) => "rearmRequestId" in message), false);
+  console.log("PASS all direct-rearm status and configuring messages carry the request ID while normal toolbar messages stay unchanged");
+}
+{
+  for (const configuringReply of [{ ok: false }, { ok: 1 }, null, () => undefined]) {
+    const h = workerHarness({ configuringReply });
+    const reply = await h.message({ type: "capture-rearm", requestId: 28 }, { url: videoUrl });
+    assert.equal(reply.ok, false);
+    assert.match(reply.error, /请点击浏览器工具栏 S 重新连接音频/);
+    assert.equal(h.stored, undefined);
+    assert.equal(h.createCount, 0);
+    assert.equal(h.streamCalls, 0);
+    assert.equal(h.offscreenMessages.some((message) => ["capture-arm", "capture-start"].includes(message.type)), false);
+    assert.equal(h.offscreenMessages.filter((message) => message.type === "capture-abort").length, 1);
+    assert.equal(h.pageMessages.filter((message) => message.type === "capture-reset").length, 1);
+    assert.equal(h.pageMessages.some((message) => message.type === "capture-configure"), false);
+    const statuses = h.pageMessages.filter((message) => message.type === "status");
+    assert.equal(statuses.every((message) => message.rearmRequestId === 28), true);
+  }
+  console.log("PASS a rejected or absent configuring acknowledgement cleans the new session before any audio environment or stream is created");
+}
+{
+  const configuring = deferred();
+  const h = workerHarness({ configuringReply: () => configuring.promise });
+  const pending = h.message({ type: "capture-rearm", requestId: 29 }, { url: videoUrl });
+  await until(() => h.pageMessages.some((message) => message.type === "capture-configuring"));
+  h.timer.fire(3000); await tick();
+  assert.equal((await pending).ok, false);
+  assert.equal(h.stored, undefined);
+  configuring.resolve({ ok: true }); await tick();
+  assert.equal(h.createCount, 0);
+  assert.equal(h.streamCalls, 0);
+  assert.equal(h.offscreenMessages.some((message) => message.type === "capture-arm"), false);
+  console.log("PASS a timed-out configuring acknowledgement cannot revive a closed or cancelled rearm when it arrives late");
+}
+console.log("42 preparation, recovery, handshake, learning, rearm, diagnostic, status, and failure lifecycle checks passed.");

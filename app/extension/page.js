@@ -1,5 +1,5 @@
 (() => {
-  const PAGE_VERSION = "0.5.2";
+  const PAGE_VERSION = "0.5.4";
   const PAGE_PROTOCOL = 1;
   const previous = window.__snsJapaneseAgentPage;
   if (previous) {
@@ -34,6 +34,14 @@
   let playbackEvents = [];
   let configured = false;
   let busy = false;
+  let recoveryPending = false;
+  let audioReleased = false;
+  let reconnecting = false;
+  let reconnectEpoch = 0;
+  let reconnectRequestId;
+  let panelDismissed = false;
+  const dismissedReconnects = new Set();
+  let formSourceIdentity;
   let preparationVersion = 0;
   let cleanupPreparation = () => {};
   let transcriptionEnabled = false;
@@ -122,10 +130,17 @@
   close.textContent = "×";
   close.title = "关闭面板";
   close.addEventListener("click", () => {
+    panelDismissed = true;
+    if (reconnecting) {
+      dismissedReconnects.add(reconnectRequestId);
+      if (dismissedReconnects.size > 8) dismissedReconnects.delete(dismissedReconnects.values().next().value);
+      reconnectEpoch++;
+    }
     stopTranscriptionPolling();
     stopLearningPolling();
+    cancelPreparation();
     suspendLearningDisplay();
-    if (configured || busy || recording) report("capture-cancel");
+    if (configured || busy || recording || (reconnecting && !audioReleased)) report("capture-cancel");
     host.style.display = "none";
     subtitle.textContent = "";
   });
@@ -162,6 +177,9 @@
   const endInput = field("终点（默认视频结尾）", "");
   const intervalInput = field("上传间隔（1–30 秒）", "5");
   intervalInput.inputMode = "decimal";
+  for (const input of [startInput, endInput, intervalInput]) {
+    input.addEventListener("input", () => { formSourceIdentity = identity(); });
+  }
   const buttons = document.createElement("div");
   buttons.style.cssText = "display:flex;gap:8px";
   const begin = document.createElement("button");
@@ -175,6 +193,12 @@
   for (const button of [begin, cancel]) button.style.cssText = "padding:6px 10px;border:1px solid #bdcec1;border-radius:6px;background:white;color:#355944;cursor:pointer;font:inherit";
   buttons.append(begin);
   controls.append(buttons);
+  const connectionHint = document.createElement("div");
+  connectionHint.className = "connection-hint";
+  connectionHint.style.cssText = "font-size:12px;color:#4a6554";
+  connectionHint.setAttribute("aria-live", "polite");
+  connectionHint.hidden = true;
+  controls.append(connectionHint);
   const metrics = document.createElement("div");
   metrics.style.cssText = "font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere";
   const replay = document.createElement("div");
@@ -207,15 +231,16 @@
   learningToolbar.append(learningStatus, alignmentNote, toolbarActions);
   panel.append(head, captureForm, learningToolbar, list);
   begin.addEventListener("click", () => {
+    if (audioReleased && !recoveryPending) { void reconnectAudio(); return; }
     if (busy || !configured || !extensionContextIsValid()) return;
     try {
       const rangeStart = parseTime(startInput.value);
-      const rangeEnd = parseTime(endInput.value);
+      const rangeEnd = endInput.value.trim() ? parseTime(endInput.value) : video?.duration;
       const batchIntervalMs = Number(intervalInput.value) * 1000;
       if (!Number.isInteger(batchIntervalMs) || batchIntervalMs < 1000 || batchIntervalMs > 30000) throw new Error("上传间隔应为 1–30 秒。");
       validateRange(rangeStart, rangeEnd, video?.duration);
       busy = true;
-      begin.disabled = true;
+      updateBeginAvailability();
       setInputsDisabled(true);
       showStatus("正在跳转到所选起点，准备采集…");
       void sendToWorker({ target: "worker", type: "capture-begin", sessionId, rangeStart, rangeEnd, batchIntervalMs })
@@ -224,7 +249,7 @@
           if (contextInvalidated) return;
           busy = false;
           configured = false;
-          begin.disabled = true;
+          updateBeginAvailability();
           cancel.disabled = false;
           setInputsDisabled(false);
           showStatus(`启动失败：${error.message}。请先点“中断／释放音频”，再点击扩展图标重试。`, true);
@@ -232,6 +257,7 @@
     } catch (error) { showStatus(error.message, true); }
   });
   cancel.addEventListener("click", () => {
+    reconnectEpoch++;
     stopTranscriptionPolling();
     stopLearningPolling();
     suspendLearningDisplay();
@@ -250,15 +276,50 @@
 
   function showStatus(text, error = false) {
     if (contextInvalidated) return;
-    host.style.display = "";
+    host.style.display = panelDismissed ? "none" : "";
     status.textContent = text;
     status.classList.toggle("error", error);
     if (error) captureForm.open = true;
   }
 
+  function updateBeginAvailability() {
+    const canReconnect = audioReleased && !recoveryPending && !busy && !recording;
+    begin.textContent = reconnecting ? "正在连接音频…" : canReconnect ? "重新连接音频" : "开始采集";
+    begin.disabled = contextInvalidated || reconnecting || recoveryPending || busy || recording || (!configured && !canReconnect);
+    connectionHint.textContent = reconnecting ? "正在连接音频，尚未开始录音。" : canReconnect
+      ? "音频已释放。请先重新连接音频，连接成功后再开始采集。" : recoveryPending
+      ? "请先点击「中断／释放音频」，再连接新的采集任务。" : "";
+    connectionHint.hidden = !connectionHint.textContent;
+  }
+
+  async function reconnectAudio() {
+    if (reconnecting || busy || recording || recoveryPending || !audioReleased || !extensionContextIsValid()) return;
+    const epoch = ++reconnectEpoch;
+    reconnectRequestId = epoch;
+    reconnecting = true;
+    updateBeginAvailability();
+    setInputsDisabled(true);
+    showStatus("正在重新连接音频；时间范围会保留，连接后请点击开始采集。");
+    try {
+      const reply = await sendToWorker({ target: "worker", type: "capture-rearm", requestId: epoch });
+      if (contextInvalidated || epoch !== reconnectEpoch) return;
+      if (!reply?.ok) throw new Error(reply?.error || "音频未重新连接，请点击浏览器工具栏 S 重新连接音频。");
+      if (!configured || sessionId !== reply.sessionId) throw new Error("音频尚未就绪，请点击浏览器工具栏 S 重新连接音频。");
+    } catch (error) {
+      if (!contextInvalidated && epoch === reconnectEpoch) showStatus(error.message, true);
+    } finally {
+      reconnecting = false;
+      if (!contextInvalidated) {
+        updateBeginAvailability();
+        if (audioReleased && !recoveryPending) setInputsDisabled(false);
+      }
+    }
+  }
+
   function invalidateContext() {
     if (contextInvalidated) return;
     contextInvalidated = true;
+    reconnectEpoch++;
     stopTranscriptionPolling();
     stopLearningPolling();
     cancelPreparation();
@@ -543,6 +604,7 @@
   }
 
   function configuring(message) {
+    panelDismissed = false;
     if (message.sessionId !== sessionId) {
       captureFormAutoCollapsed = false;
       captureFormUserOpened = false;
@@ -560,16 +622,47 @@
     cancelPreparation();
     cleanupPlayback();
     sessionId = message.sessionId;
+    recoveryPending = false;
+    audioReleased = false;
     sourceIdentity = identity();
     configured = false;
     busy = false;
     recording = false;
-    begin.disabled = true;
+    updateBeginAvailability();
     cancel.disabled = false;
     setInputsDisabled(true);
     metrics.textContent = "";
     replay.replaceChildren();
     host.style.display = "";
+    return { ok: true };
+  }
+
+  function recoverCapture(message) {
+    const states = new Set(["failed", "unknown", "source_changed", "recording", "saving"]);
+    if (typeof message.sessionId !== "string" || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(message.sessionId) || !states.has(message.recoveryState)) {
+      return { ok: false, error: "采集恢复信息无效。" };
+    }
+    if ((recording || busy) && sessionId !== message.sessionId) return { ok: false, error: "当前页面已有采集任务。" };
+    if ((recording || busy) && ["unknown", "recording", "saving"].includes(message.recoveryState)) {
+      // A healthy controller keeps its playback listeners and active recording.
+      cancel.disabled = false;
+      host.style.display = "";
+      return { ok: true };
+    }
+    cancelPreparation();
+    cleanupPlayback();
+    sessionId = message.sessionId;
+    recoveryPending = true;
+    audioReleased = false;
+    configured = false;
+    busy = false;
+    recording = false;
+    updateBeginAvailability();
+    cancel.disabled = false;
+    setInputsDisabled(true);
+    captureForm.open = true;
+    host.style.display = "";
+    updateSeekAvailability();
     return { ok: true };
   }
 
@@ -616,10 +709,13 @@
     configured = true;
     busy = false;
     recording = false;
-    startInput.value = "0:00";
-    endInput.value = String(video.duration);
-    intervalInput.value = "5";
-    begin.disabled = false;
+    if (formSourceIdentity !== identity()) {
+      startInput.value = "0:00";
+      endInput.value = String(video.duration);
+      intervalInput.value = "5";
+      formSourceIdentity = identity();
+    }
+    updateBeginAvailability();
     cancel.disabled = false;
     setInputsDisabled(false);
     metrics.textContent = "";
@@ -627,7 +723,7 @@
     sentences = [];
     list.replaceChildren();
     subtitle.textContent = "";
-    host.style.display = "";
+    host.style.display = panelDismissed ? "none" : "";
     startLearningPolling();
     return { ok: true };
   }
@@ -645,6 +741,7 @@
 
   async function prepare(message) {
     if (!extensionContextIsValid()) throw new Error("Extension context invalidated.");
+    if (recoveryPending) throw new Error("请先释放上次采集会话。");
     if (recording || message.sessionId !== sessionId) throw new Error("录制会话无效。");
     if (identity() !== sourceIdentity || findVideo() !== video) throw new Error("当前视频已切换，请重新点击扩展图标。");
     if (playerShowsAd(video)) throw new Error("请等待当前播放器的广告结束后再开始采集。");
@@ -683,6 +780,7 @@
 
   async function play(id) {
     if (!extensionContextIsValid()) throw new Error("Extension context invalidated.");
+    if (recoveryPending) throw new Error("请先释放上次采集会话。");
     if (id !== sessionId || !video || recording) throw new Error("录制会话已失效。");
     const currentVideo = video;
     const currentPlayer = playerFor(currentVideo);
@@ -902,8 +1000,8 @@
 
   function updateSeekAvailability() {
     for (const row of rows) {
-      row.button.disabled = recording || !mappedSentence(row.sentence);
-      row.button.title = !mappedSentence(row.sentence) ? "时间待确认，无法跳转" : recording ? "采集期间不能跳转；解析仍可展开" : "跳转播放这一句";
+      row.button.disabled = recording || recoveryPending || !mappedSentence(row.sentence);
+      row.button.title = !mappedSentence(row.sentence) ? "时间待确认，无法跳转" : recoveryPending ? "请先释放上次采集会话；解析仍可展开" : recording ? "采集期间不能跳转；解析仍可展开" : "跳转播放这一句";
     }
   }
 
@@ -958,7 +1056,7 @@
         row.append(translation);
       }
       row.addEventListener("click", () => {
-        if (!video || recording || !mappedSentence(sentence)) return;
+        if (!video || recording || recoveryPending || !mappedSentence(sentence)) return;
         video.currentTime = sentence.start;
         void Promise.resolve(video.play()).catch(() => showStatus("请点击视频播放器继续播放。", true));
         updateSubtitle();
@@ -1040,15 +1138,22 @@
         if (/extension context invalidated/i.test(error?.message || "")) invalidateContext();
       }
     };
+    if (Number.isSafeInteger(message.rearmRequestId) && dismissedReconnects.has(message.rearmRequestId)) {
+      sendResponse({ ok: false, error: "音频连接已取消。" });
+      return;
+    }
     if (message.type === "page-handshake") {
       sendResponse(pageInfo());
     } else if (message.type === "status") {
       showStatus(message.text, message.error);
       sendResponse({ ok: true });
     } else if (message.type === "capture-show") {
+      panelDismissed = false;
       host.style.display = "";
       if (sentences.length) { video?.addEventListener("timeupdate", updateSubtitle); activeId = ""; updateSubtitle(); }
       sendResponse({ ok: true });
+    } else if (message.type === "capture-recovery") {
+      sendResponse(recoverCapture(message));
     } else if (message.type === "capture-configuring") {
       sendResponse(configuring(message));
     } else if (message.type === "capture-configure") {
@@ -1081,7 +1186,7 @@
       cancelPreparation();
       configured = false;
       busy = false;
-      begin.disabled = true;
+      updateBeginAvailability();
       cancel.disabled = false;
       setInputsDisabled(false);
       sendResponse({ ok: true });
@@ -1091,9 +1196,13 @@
       stopPlayback();
       configured = false;
       busy = false;
+      recoveryPending = false;
+      audioReleased = true;
       cancel.disabled = true;
-      begin.disabled = true;
-      setInputsDisabled(false);
+      updateBeginAvailability();
+      setInputsDisabled(reconnecting);
+      if (!message.complete) metrics.textContent = "";
+      updateSeekAvailability();
       sendResponse({ ok: true });
     } else if (message.type === "prepare" || message.type === "play") {
       const action = message.type === "prepare" ? prepare(message) : play(message.sessionId);

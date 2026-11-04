@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "SNS Japanese Agent",
-  "version": "0.5.2",
+  "version": "0.5.4",
   "description": "Capture a selected YouTube audio range in acknowledged batches and replay the locally saved recording.",
   "minimum_chrome_version": "116",
   "permissions": [

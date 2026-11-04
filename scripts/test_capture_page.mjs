@@ -85,7 +85,8 @@ class FakeElement {
 }
 
 function harness({ duration = NaN, pendingPlay = false, failBegin = false, shorts = false, transcriptionEnabled = false, statusReplies = [], foreignPanel = false,
-  enrichmentEnabled = false, learningReplies = [], learningLoadReply = { capture_id: null, status: "not_found", result: null } } = {}) {
+  enrichmentEnabled = false, learningReplies = [], learningLoadReply = { capture_id: null, status: "not_found", result: null },
+  rearmReply = { ok: false, error: "音频未重新连接，请点击浏览器工具栏 S 重新连接音频。" } } = {}) {
   const timers = new Map();
   const messages = [];
   let time = 0;
@@ -165,6 +166,7 @@ function harness({ duration = NaN, pendingPlay = false, failBegin = false, short
   };
   async function replyToMessage(message) {
     if (failBegin && message.type === "capture-begin") throw new Error("Synthetic startup failure");
+    if (message.type === "capture-rearm") return typeof rearmReply === "function" ? rearmReply(message) : rearmReply;
     if (message.type === "capture-transcription-status") {
       const reply = statusReplies[statusCalls++] ?? { status: "waiting_for_audio", windows_done: 0, windows_total: 0, sentences: 0 };
       const value = typeof reply === "function" ? await reply() : await reply;
@@ -241,6 +243,7 @@ function harness({ duration = NaN, pendingPlay = false, failBegin = false, short
     get panelCount() { return document.documentElement.children.filter((element) => element.id === rootId).length; },
     get foreignPanelConnected() { return foreignRoot?.isConnected === true && foreignRoot.parentElement === document.documentElement; },
     get panelVersion() { return elements.find((element) => element.className === "version")?.textContent; },
+    get panelDisplay() { return root.style.display; },
     get statusCalls() { return statusCalls; },
     get timerCount() { return timers.size; },
     get runtimeFailures() { return runtimeFailures; },
@@ -306,12 +309,13 @@ function harness({ duration = NaN, pendingPlay = false, failBegin = false, short
   await h.advance(250);
   const reply = await configured;
   assert.equal(reply.ok, false);
-  assert.equal(h.begin.disabled, true);
+  assert.equal(h.begin.disabled, false);
+  assert.equal(h.begin.textContent, "重新连接音频");
   assert.equal(h.metadataListeners(), 0);
   h.video.duration = 120;
   h.video.emit("loadedmetadata");
   await flush();
-  assert.equal(h.begin.disabled, true, "Late metadata from a cancelled session must not re-enable capture");
+  assert.equal(h.begin.textContent, "重新连接音频", "Late metadata must not turn released audio back into a ready capture");
   console.log("PASS reset cancels metadata preparation and ignores late readiness events");
 }
 {
@@ -609,9 +613,9 @@ for (const mode of ["sync", "async"]) {
   const h = await recording();
   const handshake = await h.dispatch("page-handshake");
   assert.equal(handshake.ok, true);
-  assert.equal(handshake.version, "0.5.2");
+  assert.equal(handshake.version, "0.5.4");
   assert.equal(handshake.protocol, 1);
-  assert.equal(h.panelVersion, "v0.5.2");
+  assert.equal(h.panelVersion, "v0.5.4");
   assert.equal(h.injectionResult.version, handshake.version);
   assert.equal(h.reinject().version, handshake.version);
   assert.equal(h.panelCount, 1);
@@ -649,7 +653,7 @@ for (const mode of ["sync", "async"]) {
   const h = harness({ duration: 120, foreignPanel: true });
   assert.equal(h.injectionResult.ok, true);
   assert.equal((await h.configure()).ok, true);
-  assert.equal((await h.dispatch("page-handshake")).version, "0.5.2");
+  assert.equal((await h.dispatch("page-handshake")).version, "0.5.4");
   assert.equal(h.panelCount, 1);
   assert.equal(h.foreignPanelConnected, true, "The new extension must not remove another installation's panel");
   assert.equal(h.begin.disabled, false);
@@ -892,4 +896,206 @@ console.log("PASS cancellation and closure ignore late learning responses and st
     "A mapped estimate remains usable for sentence playback");
   console.log("PASS mapped timing uncertainty is explained once without repetitive per-sentence error warnings");
 }
-console.log("46 offline page lifecycle, layout, and learning checks passed.");
+{
+  for (const [state, pendingBatches] of [["failed", 0], ["unknown", 4], ["recording", 0], ["saving", 1]]) {
+    const h = harness({ duration: 120 });
+    assert.equal(h.cancel.disabled, true);
+    const reply = await h.dispatch("capture-recovery", { sessionId: cachedCaptureId, recoveryState: state, pendingBatches });
+    assert.equal(reply.ok, true);
+    assert.equal(h.cancel.disabled, false, "A fresh page must bind the retained session before enabling release");
+    assert.equal(h.begin.disabled, true);
+    assert.ok(h.inputs.every((input) => input.disabled));
+    assert.equal(h.playCalls, 0);
+    assert.equal(h.messages.length, 0, "Recovery binding must not send capture, upload or cloud work");
+    h.cancel.click(); await flush();
+    assert.equal(h.messages.find((message) => message.type === "capture-cancel").sessionId, cachedCaptureId);
+    await h.dispatch("capture-reset", { sessionId: cachedCaptureId });
+    assert.equal((await h.configure()).ok, true);
+    assert.equal(h.begin.disabled, false, "After release a new preparation can enable capture normally");
+  }
+  console.log("PASS fresh pages can explicitly release retained failed, unknown, recording and saving sessions before retrying");
+}
+{
+  const h = harness({ duration: 120, learningLoadReply: learningValue() });
+  await h.configure(); await flush();
+  await h.dispatch("capture-recovery", { sessionId: cachedCaptureId, recoveryState: "unknown" });
+  assert.equal(h.list.children.length, 1, "Recovery must preserve cached learning notes");
+  assert.equal(h.list.children[0].children[0].disabled, true, "An unknown capture must not be disrupted by seeking");
+  const messages = h.messages.length;
+  h.list.children[0].children[1].click();
+  assert.equal(h.list.children[0].children[2].hidden, false);
+  assert.equal(h.messages.length, messages, "Expanding existing notes remains local during recovery");
+  assert.equal((await h.dispatch("prepare", { sessionId: cachedCaptureId, rangeStart: 0, rangeEnd: 2, batchIntervalMs: 5000 })).ok, false);
+  assert.equal((await h.dispatch("play", { sessionId: cachedCaptureId })).ok, false);
+  assert.equal(h.playCalls, 0);
+  await h.dispatch("capture-reset", { sessionId: cachedCaptureId });
+  assert.equal(h.list.children[0].children[0].disabled, false);
+  console.log("PASS recovery preserves learning analyses while preventing playback and capture until release");
+}
+{
+  const h = await recording();
+  const listenerCount = (h.video.listeners.get("timeupdate") || []).length;
+  assert.equal((await h.dispatch("capture-recovery", { recoveryState: "recording" })).ok, true);
+  assert.equal(h.video.paused, false);
+  assert.equal((h.video.listeners.get("timeupdate") || []).length, listenerCount);
+  assert.equal(h.cancel.disabled, false);
+  assert.equal((await h.dispatch("capture-recovery", { sessionId: cachedCaptureId, recoveryState: "unknown" })).ok, false);
+  h.video.currentTime = 300; h.video.emit("timeupdate"); await flush();
+  assert.equal(h.messages.filter((message) => message.type === "page-ended").length, 1,
+    "Recovering controls must not remove an active controller's natural completion listeners");
+  console.log("PASS reopening an active capture keeps playback and completion protected without switching sessions");
+}
+{
+  const h = harness({ duration: 120 });
+  for (const payload of [{ sessionId: "invalid", recoveryState: "failed" }, { sessionId: cachedCaptureId, recoveryState: "arbitrary" }]) {
+    assert.equal((await h.dispatch("capture-recovery", payload)).ok, false);
+    assert.equal(h.cancel.disabled, true);
+  }
+  assert.equal(h.messages.length, 0);
+  console.log("PASS malformed recovery messages cannot bind release controls or dispatch work");
+}
+{
+  let resolveRearm;
+  const h = harness({ duration: 1800, rearmReply: () => new Promise((resolve) => { resolveRearm = resolve; }) });
+  await h.configure();
+  await h.dispatch("capture-reset");
+  assert.equal(h.begin.disabled, false, "Released audio must offer an actual reconnect action");
+  assert.equal(h.begin.textContent, "重新连接音频");
+  h.inputs[0].value = "16:00"; h.inputs[0].emit("input");
+  h.inputs[1].value = "18:00"; h.inputs[1].emit("input");
+  h.inputs[2].value = "7"; h.inputs[2].emit("input");
+  h.begin.click(); h.begin.click(); await flush();
+  assert.equal(h.messages.filter((message) => message.type === "capture-rearm").length, 1);
+  assert.equal(h.begin.disabled, true);
+  assert.ok(h.inputs.every((input) => input.disabled));
+  assert.equal(h.playCalls, 0);
+  const newSessionId = "00000000-0000-4000-8000-000000000003";
+  await h.dispatch("capture-configuring", { sessionId: newSessionId });
+  await h.dispatch("capture-configure", { sessionId: newSessionId });
+  assert.equal(h.begin.disabled, true, "A pending reconnect must not enable duplicate starts");
+  resolveRearm({ ok: true, sessionId: newSessionId }); await flush();
+  assert.equal(h.begin.disabled, false);
+  assert.equal(h.begin.textContent, "开始采集");
+  assert.deepEqual(h.inputs.map((input) => input.value), ["16:00", "18:00", "7"]);
+  assert.equal(h.messages.some((message) => message.type === "capture-begin"), false,
+    "Connecting audio must not start recording, seek or initiate cloud processing");
+  h.begin.click(); await flush();
+  const begin = h.messages.find((message) => message.type === "capture-begin");
+  assert.equal(begin.sessionId, newSessionId);
+  assert.equal(begin.rangeStart, 960); assert.equal(begin.rangeEnd, 1080); assert.equal(begin.batchIntervalMs, 7000);
+  console.log("PASS released audio reconnects once, preserves the selected range and waits for an explicit recording start");
+}
+{
+  for (const rearmReply of [undefined, { ok: true, sessionId }, { ok: false, error: "请点击浏览器工具栏 S 重新连接音频。" }]) {
+    const h = harness({ duration: 1800, rearmReply });
+    await h.configure(); await h.dispatch("capture-reset");
+    h.inputs[0].value = "16:00"; h.inputs[0].emit("input");
+    h.inputs[1].value = "18:00"; h.inputs[1].emit("input");
+    h.begin.click(); await flush();
+    assert.match(h.status.textContent, /工具栏 S/);
+    assert.equal(h.begin.disabled, false);
+    assert.equal(h.begin.textContent, "重新连接音频");
+    assert.ok(h.inputs.every((input) => !input.disabled));
+    assert.equal(h.inputs[0].value, "16:00"); assert.equal(h.inputs[1].value, "18:00");
+    assert.equal(h.messages.some((message) => message.type === "capture-begin"), false);
+  }
+  console.log("PASS failed or unconfirmed reconnection remains actionable and explains the toolbar fallback without starting capture");
+}
+{
+  const h = harness({ duration: 1800 });
+  await h.configure();
+  h.inputs[0].value = "16:00"; h.inputs[0].emit("input");
+  h.inputs[1].value = "18:00"; h.inputs[1].emit("input");
+  await h.dispatch("capture-reset");
+  await h.configure();
+  assert.equal(h.inputs[0].value, "16:00"); assert.equal(h.inputs[1].value, "18:00");
+  h.video.duration = 1000;
+  await h.configure(); h.begin.click(); await flush();
+  assert.match(h.status.textContent, /有效的起止时间/);
+  assert.equal(h.messages.some((message) => message.type === "capture-begin"), false,
+    "A preserved selection must still be checked against the current video duration");
+  h.location.href = "https://www.youtube.com/watch?v=ZyXwVu987_-";
+  await h.configure();
+  assert.deepEqual(h.inputs.map((input) => input.value), ["0:00", "1000", "5"], "A different video must not inherit the old range");
+  console.log("PASS toolbar reconnection preserves same-video selections, revalidates duration and resets selections for a different video");
+}
+{
+  const h = harness({ duration: 1800 });
+  await h.dispatch("capture-recovery", { sessionId: cachedCaptureId, recoveryState: "failed" });
+  await h.dispatch("capture-reset", { sessionId: cachedCaptureId });
+  h.inputs[0].value = "16:00"; h.inputs[0].emit("input");
+  h.inputs[1].value = "18:00"; h.inputs[1].emit("input");
+  await h.configure();
+  assert.deepEqual(h.inputs.map((input) => input.value), ["16:00", "18:00", "5"]);
+  assert.equal(h.begin.disabled, false);
+  console.log("PASS a refreshed recovery panel retains selections entered after release before its first successful preparation");
+}
+{
+  let resolveRearm;
+  const h = harness({ duration: 1800, rearmReply: () => new Promise((resolve) => { resolveRearm = resolve; }) });
+  await h.configure(); await h.dispatch("capture-reset");
+  h.begin.click(); await flush();
+  await h.dispatch("capture-configuring");
+  h.cancel.click(); await flush();
+  await h.dispatch("capture-reset");
+  resolveRearm({ ok: true, sessionId }); await flush();
+  assert.equal(h.begin.disabled, false);
+  assert.equal(h.begin.textContent, "重新连接音频");
+  assert.equal(h.messages.some((message) => message.type === "capture-begin"), false);
+  assert.equal(h.playCalls, 0);
+  console.log("PASS cancelling a pending reconnect ignores late success and requires a fresh connection before recording");
+}
+{
+  const h = harness({ duration: 1800 });
+  await h.dispatch("capture-recovery", { sessionId: cachedCaptureId, recoveryState: "failed" });
+  await h.dispatch("capture-reset", { sessionId: cachedCaptureId });
+  h.inputs[0].value = "16:00"; h.inputs[0].emit("input");
+  await h.configure();
+  assert.equal(h.inputs[1].value, "");
+  h.begin.click(); await flush();
+  const begin = h.messages.find((message) => message.type === "capture-begin");
+  assert.equal(begin.rangeStart, 960); assert.equal(begin.rangeEnd, 1800);
+  console.log("PASS a blank end time uses the current video ending after recovery when only the start was entered");
+}
+{
+  let resolveRearm;
+  const h = harness({ duration: 1800, rearmReply: () => new Promise((resolve) => { resolveRearm = resolve; }) });
+  await h.configure(); await h.dispatch("capture-reset");
+  h.begin.click(); await flush();
+  const requestId = h.messages.find((message) => message.type === "capture-rearm").requestId;
+  assert.ok(Number.isSafeInteger(requestId) && requestId > 0);
+  h.close.click(); await flush();
+  assert.equal(h.panelDisplay, "none");
+  const payload = { sessionId: cachedCaptureId, rearmRequestId: requestId };
+  assert.equal((await h.dispatch("capture-configuring", payload)).ok, false);
+  assert.equal((await h.dispatch("capture-configure", payload)).ok, false);
+  await h.dispatch("status", { ...payload, text: "Late connection status" });
+  resolveRearm({ ok: true, sessionId: cachedCaptureId }); await flush();
+  assert.equal(h.panelDisplay, "none", "A dismissed reconnect must not reopen or arm the page later");
+  assert.equal(h.messages.some((message) => message.type === "capture-begin"), false);
+  assert.equal(h.playCalls, 0);
+  await h.configure();
+  assert.notEqual(h.panelDisplay, "none", "A later explicit toolbar preparation must still reopen normally");
+  console.log("PASS closing before a reconnect binds its new session rejects late preparation and status without blocking a later toolbar action");
+}
+{
+  let resolveRearm;
+  const h = harness({ duration: NaN, rearmReply: () => new Promise((resolve) => { resolveRearm = resolve; }) });
+  await h.dispatch("capture-configuring"); await h.dispatch("capture-reset");
+  h.begin.click(); await flush();
+  const requestId = h.messages.find((message) => message.type === "capture-rearm").requestId;
+  const payload = { sessionId: cachedCaptureId, rearmRequestId: requestId };
+  await h.dispatch("capture-configuring", payload);
+  const pendingConfigure = h.dispatch("capture-configure", payload); await flush();
+  assert.ok(h.metadataListeners() > 0);
+  h.close.click(); await flush();
+  assert.equal((await pendingConfigure).ok, false);
+  assert.equal(h.metadataListeners(), 0);
+  h.video.duration = 1800; h.video.emit("loadedmetadata"); await flush();
+  resolveRearm({ ok: false }); await flush();
+  assert.equal(h.panelDisplay, "none");
+  assert.equal(h.messages.find((message) => message.type === "capture-cancel").sessionId, cachedCaptureId);
+  assert.equal(h.messages.some((message) => message.type === "capture-begin"), false);
+  console.log("PASS closing during a reconnect metadata wait cancels preparation synchronously and late readiness cannot reopen the panel");
+}
+console.log("58 offline page lifecycle, layout, and learning checks passed.");

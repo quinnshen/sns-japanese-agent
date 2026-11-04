@@ -1,9 +1,13 @@
 const SESSION_KEY = "activeCapture";
 const API = "http://127.0.0.1:8766";
-const PAGE_VERSION = "0.5.2";
+const PAGE_VERSION = "0.5.4";
 const PAGE_PROTOCOL = 1;
 let creatingOffscreen;
 let opening = false;
+let releasing;
+const REARM_BUSY = "正在连接音频，请稍候后重试。";
+const REARM_ACTIVE = "已有采集任务，请先中断／释放音频后重试。";
+const REARM_FALLBACK = "音频未重新连接，请点击浏览器工具栏 S 重新连接音频。";
 
 async function within(promise, milliseconds, message) {
   let timer;
@@ -79,19 +83,32 @@ async function ensurePage(tabId) {
   if (reply.protocol !== PAGE_PROTOCOL) throw failure("handshake_protocol_mismatch", "响应的页面脚本与扩展通信协议不一致。");
 }
 
-async function status(tabId, text, error = false) {
+async function status(tabId, text, error = false, metadata = {}) {
   await chrome.action.setBadgeText({ tabId, text: error ? "ERR" : "JA" });
   await chrome.action.setBadgeBackgroundColor({ tabId, color: error ? "#b42318" : "#176b45" });
   await chrome.action.setTitle({ tabId, title: text });
-  await pageMessage(tabId, { type: "status", text, error }).catch(() => {});
+  await pageMessage(tabId, { type: "status", text, error, ...metadata }).catch(() => {});
 }
 
-async function finish(session, payload = {}) {
-  const stored = (await chrome.storage.session.get(SESSION_KEY))[SESSION_KEY];
-  if (stored?.sessionId !== session.sessionId) return;
-  await within(pageMessage(session.tabId, { type: "capture-reset", sessionId: session.sessionId, ...payload }), 3000, "面板关闭超时").catch(() => {});
-  await chrome.storage.session.remove(SESSION_KEY);
-  await within(chrome.offscreen.closeDocument(), 3000, "采集环境关闭超时").catch(() => {});
+function finish(session, payload = {}) {
+  // A reset can prompt a direct reconnect before closeDocument has settled. Keep
+  // all later openings behind the complete release, including concurrent actions.
+  let closed;
+  const reported = Promise.resolve(releasing).then(async () => {
+    const stored = (await chrome.storage.session.get(SESSION_KEY))[SESSION_KEY];
+    if (stored?.sessionId !== session.sessionId) return;
+    await within(pageMessage(session.tabId, { type: "capture-reset", sessionId: session.sessionId, ...payload }), 3000, "面板关闭超时").catch(() => {});
+    await chrome.storage.session.remove(SESSION_KEY);
+    closed = chrome.offscreen.closeDocument().catch(() => {});
+    await within(closed, 3000, "采集环境关闭超时").catch(() => {});
+  });
+  // UI cancellation remains bounded, while a delayed Chrome close must actually
+  // settle before a replacement document can be opened.
+  const work = reported.then(() => closed);
+  releasing = work;
+  const clear = () => { if (releasing === work) releasing = undefined; };
+  void work.then(clear, clear);
+  return reported;
 }
 
 function validVideoUrl(value) {
@@ -102,14 +119,50 @@ function validVideoUrl(value) {
   } catch (_) { return false; }
 }
 
-async function openAgent(tab) {
-  if (opening) return;
+async function showCaptureRecovery(active, inspected, recoveryState) {
+  const count = (value) => Number.isSafeInteger(value) && value >= 0 && value <= 1_000_000_000 ? value : null;
+  const pendingBatches = count(inspected?.pendingBatches);
+  const pendingBytes = count(inspected?.pendingBytes);
+  const reply = await within(pageMessage(active.tabId, {
+    type: "capture-recovery", sessionId: active.sessionId, recoveryState, pendingBatches, pendingBytes,
+    transcriptionEnabled: active.transcriptionEnabled === true,
+    enrichmentEnabled: active.enrichmentEnabled === true,
+  }), 3000, "无法显示旧采集任务的恢复控件，请刷新视频页面后重试。");
+  if (!reply?.ok) throw new Error("无法显示旧采集任务的恢复控件，请刷新视频页面后重试。");
+  let message;
+  if (recoveryState === "recording") message = "已有采集正在进行，未重新开始录音。可点击“中断／释放音频”明确结束。";
+  else if (recoveryState === "saving") message = "已有采集正在保存批次，未重新开始录音。可等待完成，或点击“中断／释放音频”明确结束。";
+  else {
+    const prefix = recoveryState === "source_changed" ? "视频已切换，旧的采集准备不能复用。" :
+      recoveryState === "failed" ? "上次采集已停止。" : "无法确认上次采集状态。";
+    const pending = pendingBatches === null ? "待确认数据量未知。" : pendingBatches === 0 ? "没有待确认批次。" :
+      `待确认 ${pendingBatches} 批${pendingBytes === null ? "" : `（${pendingBytes} 字节）`}仍保留在浏览器。`;
+    message = `${prefix}${pending}请点击“中断／释放音频”释放旧采集环境，再重新点击扩展图标。本机已保存的批次仍保留。`;
+  }
+  await status(active.tabId, message, !["recording", "saving"].includes(recoveryState));
+}
+
+async function openAgent(tab, { freshOnly = false, rearmRequestId } = {}) {
+  if (opening) return { ok: false, error: REARM_BUSY };
   opening = true;
   let session;
+  const metadata = freshOnly ? { rearmRequestId } : {};
+  const notify = (tabId, text, error = false) => status(tabId, text, error, metadata);
+  const configureMessage = (tabId, payload) => pageMessage(tabId, { ...payload, ...metadata });
   try {
+    if (releasing) await within(releasing, 4000, "上次音频环境仍在关闭，请稍后重新点击扩展图标。");
     if (!tab.id || !validVideoUrl(tab.url)) throw new Error("请先打开 YouTube 视频或 Shorts 页面。");
+    if (freshOnly) {
+      const currentTab = await chrome.tabs.get(tab.id);
+      if (currentTab.id !== tab.id || currentTab.active !== true || currentTab.url !== tab.url) {
+        return { ok: false, error: REARM_FALLBACK };
+      }
+      tab = currentTab;
+    }
     await ensurePage(tab.id);
     const active = (await chrome.storage.session.get(SESSION_KEY))[SESSION_KEY];
+    // Reconnect never inspects, releases, resumes, or replaces an existing queue.
+    if (freshOnly && active) return { ok: false, error: REARM_ACTIVE };
     if (active) {
       const contexts = await within(chrome.runtime.getContexts({
         contextTypes: ["OFFSCREEN_DOCUMENT"], documentUrls: [chrome.runtime.getURL("offscreen.html")],
@@ -117,29 +170,42 @@ async function openAgent(tab) {
       if (contexts.length) {
         if (active.tabId !== tab.id) await ensurePage(active.tabId);
         await pageMessage(active.tabId, { type: "capture-show" }).catch(() => {});
-        if (active.tabId !== tab.id) await status(tab.id, "另一个标签页已有采集任务，请先结束该任务。", true);
+        if (active.tabId !== tab.id) await notify(tab.id, "另一个标签页已有采集任务，请先结束该任务。", true);
         else {
-          const inspected = await within(offscreenMessage({ type: "capture-inspect", sessionId: active.sessionId }), 3000,
-            "无法确认采集状态；请点击面板的中断按钮释放后重试。");
+          let inspected;
+          try {
+            inspected = await within(offscreenMessage({ type: "capture-inspect", sessionId: active.sessionId }), 3000,
+              "无法确认采集状态。");
+          } catch (_) {
+            await showCaptureRecovery(active, undefined, "unknown");
+            return;
+          }
           if (inspected?.ok && inspected.phase === "ready") {
+            if (active.sourceUrl !== tab.url) {
+              await showCaptureRecovery(active, inspected, "source_changed");
+              return;
+            }
             session = active;
-            await pageMessage(tab.id, { type: "capture-configuring", ...active });
-            const reply = await within(pageMessage(tab.id, { type: "capture-configure", ...active }), 12_000,
+            const configuring = await within(configureMessage(tab.id, { type: "capture-configuring", ...active }),
+              3000, "采集准备界面未响应。");
+            if (configuring?.ok !== true) throw new Error("采集准备已取消。");
+            const reply = await within(configureMessage(tab.id, { type: "capture-configure", ...active }), 12_000,
               "视频信息读取超时，请先正常播放视频后重试。");
             if (!reply?.ok) throw new Error(reply?.error || "请先正常播放视频后重试。");
             active.phase = "ready";
             await checkCurrent(active);
             await chrome.storage.session.set({ [SESSION_KEY]: active });
-            await status(tab.id, active.enrichmentEnabled
+            await notify(tab.id, active.enrichmentEnabled
               ? "音频已准备。开始采集后将分批发送 Google 转写，并自动预生成翻译和解析。"
               : active.transcriptionEnabled
               ? "音频已准备。选择范围后点击开始；开始采集后将分批发送 Google 转写。"
               : "音频已准备。选择范围后点击开始；尚未录音。");
           } else if (inspected?.ok && inspected.phase === "failed") {
-            await pageMessage(tab.id, { type: "capture-failed", sessionId: active.sessionId }).catch(() => {});
-            await status(tab.id, `上次采集已停止，待确认 ${inspected.pendingBatches || 0} 批仍保留；请点击中断按钮明确释放后重试。`, true);
-          } else if (!inspected?.ok) {
-            await status(tab.id, "无法确认采集状态；请点击面板的中断按钮释放后重试。", true);
+            await showCaptureRecovery(active, inspected, "failed");
+          } else if (inspected?.ok && ["recording", "saving"].includes(inspected.phase)) {
+            await showCaptureRecovery(active, inspected, inspected.phase);
+          } else {
+            await showCaptureRecovery(active, inspected?.ok ? inspected : undefined, "unknown");
           }
         }
         return;
@@ -147,7 +213,7 @@ async function openAgent(tab) {
       // No offscreen document means its in-memory queue is already gone; keep disk batches untouched.
       await chrome.storage.session.remove(SESSION_KEY);
     }
-    await status(tab.id, "正在连接本机采集服务…");
+    await notify(tab.id, "正在连接本机采集服务…");
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5000);
     let health;
@@ -161,41 +227,47 @@ async function openAgent(tab) {
       transcriptionEnabled: health.capabilities?.capture_transcription === true,
       enrichmentEnabled: health.capabilities?.capture_enrichment === true && health.capabilities?.capture_transcription === true };
     await chrome.storage.session.set({ [SESSION_KEY]: session });
-    await pageMessage(tab.id, { type: "capture-configuring", ...session });
-    await status(tab.id, "正在准备音频采集环境…若视频尚未加载，请先让它正常播放。");
+    const configuring = await within(configureMessage(tab.id, { type: "capture-configuring", ...session }),
+      3000, "采集准备界面未响应。");
+    if (configuring?.ok !== true) throw new Error("采集准备已取消。");
+    await notify(tab.id, "正在准备音频采集环境…若视频尚未加载，请先让它正常播放。");
     await ensureOffscreen();
     await checkCurrent(session);
-    await status(tab.id, "正在请求当前标签页的音频访问…");
-    // Obtain and immediately consume the short-lived stream ID during the extension action.
+    await notify(tab.id, "正在请求当前标签页的音频访问…");
+    // Obtain and immediately consume the short-lived stream ID. The user first
+    // authorizes this tab through the toolbar; a panel reconnect may reuse that grant.
     // The recorder starts only after the user confirms the selected range in the panel.
     const streamId = await within(chrome.tabCapture.getMediaStreamId({ targetTabId: tab.id }), 10_000,
       "请求标签页音频访问超时。请先正常播放视频，再重新点击扩展图标。");
     await checkCurrent(session);
-    await status(tab.id, "正在连接标签页音频与扬声器…");
+    await notify(tab.id, "正在连接标签页音频与扬声器…");
     const armed = await within(offscreenMessage({ type: "capture-arm", ...session, streamId }), 16_000,
       "音频准备超时。请先正常播放视频，再重新点击扩展图标。");
     if (!armed?.ok) throw new Error(armed?.error || "无法准备标签页音频");
     await checkCurrent(session);
     session.phase = "ready";
     await chrome.storage.session.set({ [SESSION_KEY]: session });
-    await status(tab.id, "音频已连接，正在读取视频信息…");
-    const reply = await within(pageMessage(tab.id, { type: "capture-configure", ...session }), 12_000,
+    await notify(tab.id, "音频已连接，正在读取视频信息…");
+    const reply = await within(configureMessage(tab.id, { type: "capture-configure", ...session }), 12_000,
       "视频信息读取超时，请先正常播放视频后重试。");
     if (!reply?.ok) throw new Error(reply?.error || "无法读取视频；请先让视频正常播放后重试。");
     await checkCurrent(session);
     session.phase = "ready";
     await chrome.storage.session.set({ [SESSION_KEY]: session });
-    await status(tab.id, session.enrichmentEnabled
+    await notify(tab.id, session.enrichmentEnabled
       ? "选择采集范围后开始。将分批发送 Google 转写，并自动调用 GPT 预生成翻译和解析；点击解析只展示已保存内容。"
       : session.transcriptionEnabled
       ? "选择采集范围和上传间隔，再点击开始。开始采集后将分批发送 Google 转写，不调用 GPT。"
       : "选择采集范围和上传间隔，再点击开始。尚未录音，不调用云端服务。");
+    return { ok: true, sessionId: session.sessionId };
   } catch (error) {
-    if (tab.id) await status(tab.id, `准备失败：${error.message}`, true);
+    const failure = freshOnly ? REARM_FALLBACK : `准备失败：${error.message}`;
+    if (tab.id) await notify(tab.id, failure, true).catch(() => {});
     if (session) {
       await within(offscreenMessage({ type: "capture-abort", sessionId: session.sessionId }), 3000, "音频准备取消超时").catch(() => {});
       await finish(session);
     }
+    return { ok: false, error: freshOnly ? REARM_FALLBACK : failure };
   } finally { opening = false; }
 }
 
@@ -412,6 +484,19 @@ async function learningStatus(path, captureId) {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.target !== "worker") return;
+  if (message.type === "capture-rearm") {
+    if (sender.id !== chrome.runtime.id || !Number.isSafeInteger(sender.tab?.id) || sender.tab.id <= 0 ||
+        sender.frameId !== 0 || !validVideoUrl(sender.url) ||
+        !Number.isSafeInteger(message.requestId) || message.requestId <= 0 || message.requestId > 1_000_000_000) {
+      sendResponse({ ok: false, error: REARM_FALLBACK });
+      return;
+    }
+    // Derive the target exclusively from the isolated page's verified sender.
+    // openAgent rechecks the active tab after any in-progress release settles.
+    openAgent({ id: sender.tab.id, url: sender.url }, { freshOnly: true, rearmRequestId: message.requestId })
+      .then(sendResponse).catch(() => sendResponse({ ok: false, error: REARM_FALLBACK }));
+    return true;
+  }
   if (message.type === "capture-learning-status" || message.type === "capture-learning-load") {
     if (sender.id !== chrome.runtime.id || !sender.tab || sender.frameId !== 0 ||
         !validVideoUrl(sender.url || sender.tab.url) ||
