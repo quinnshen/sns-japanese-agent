@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlparse
 
 from config import setting
 from capture_store import CaptureError, CaptureStore
+from capture_transcription import TranscriptionError
 from pipeline import MAX_DURATION_SECONDS, save_result, transcribe_media
 from enrich import enrich_result, local_api_key
 
@@ -27,6 +28,16 @@ jobs_lock = threading.Lock()
 @lru_cache(maxsize=8)
 def capture_store(root: Path) -> CaptureStore:
     return CaptureStore(root)
+
+
+def transcription_enabled() -> bool:
+    return setting("ENABLE_CAPTURE_TRANSCRIPTION", "0") == "1"
+
+
+def wake_transcription(manifest: dict) -> None:
+    if transcription_enabled() and manifest["status"] in {"recording", "complete"}:
+        from capture_transcription import request_processing
+        request_processing(DATA_DIR / "captures" / manifest["id"], enabled=transcription_enabled)
 
 
 def trusted_request_source(host: str, origin: str) -> bool:
@@ -167,6 +178,17 @@ class Handler(BaseHTTPRequestHandler):
     def capture_error(self, error: CaptureError) -> None:
         self.send_json(error.status, {"error": error.error, **error.details})
 
+    def acknowledge_capture(self, payload: dict, manifest: dict | None = None) -> None:
+        try:
+            self.send_json(200, payload)
+        finally:
+            if manifest is not None:
+                try:
+                    wake_transcription(manifest)
+                except Exception:
+                    # A scheduler failure must never rewrite an already saved batch ACK.
+                    self.log_message("Local transcription scheduling failed")
+
     def capture_post(self) -> None:
         try:
             payload = self.capture_json()
@@ -180,7 +202,9 @@ class Handler(BaseHTTPRequestHandler):
             capture_id, action = match.groups()
             operation = {"timing": store.set_timing, "complete": store.complete}
             result = store.abort(capture_id, payload) if action == "abort" else operation[action](capture_id, payload)
-            self.send_json(200, result)
+            self.acknowledge_capture(result, result if action != "abort" else None)
+        except (BrokenPipeError, ConnectionResetError):
+            return
         except CaptureError as error:
             self.capture_error(error)
         except (OSError, ValueError, TypeError, KeyError):
@@ -256,7 +280,9 @@ class Handler(BaseHTTPRequestHandler):
                 raise CaptureError(400, "Invalid batch timing headers") from None
             store = capture_store(DATA_DIR / "captures")
             result = store.put_batch(match[1], int(match[2]), self.read_body(length), metadata)
-            self.send_json(200, result)
+            self.acknowledge_capture(result, store.get(match[1]) if transcription_enabled() else None)
+        except (BrokenPipeError, ConnectionResetError):
+            return
         except CaptureError as error:
             self.capture_error(error)
         except (OSError, ValueError, TypeError, KeyError):
@@ -288,12 +314,20 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "capabilities": {
                     "capture_batches": True,
-                    "cloud_processing": setting("ENABLE_LEGACY_PIPELINE", "0") == "1",
+                    "cloud_processing": setting("ENABLE_LEGACY_PIPELINE", "0") == "1" or transcription_enabled(),
+                    "capture_transcription": transcription_enabled(),
                 },
             })
             return
         if self.path.startswith("/captures/"):
             try:
+                transcription_match = re.fullmatch(r"/captures/([0-9a-f-]{36})/transcription", self.path)
+                if transcription_match:
+                    from capture_transcription import read_status, read_result
+                    capture_store(DATA_DIR / "captures").get(transcription_match[1])
+                    directory = DATA_DIR / "captures" / transcription_match[1]
+                    self.send_json(200, {**read_status(directory), "result": read_result(directory)})
+                    return
                 match = re.fullmatch(r"/captures/([0-9a-f-]{36})(/audio)?", self.path)
                 if not match:
                     raise CaptureError(404, "Capture route not found")
@@ -305,7 +339,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             except CaptureError as error:
                 self.capture_error(error)
-            except (OSError, ValueError, TypeError, KeyError):
+            except (OSError, ValueError, TypeError, KeyError, TranscriptionError):
                 self.send_json(500, {"error": "Local capture storage operation failed"})
             return
         parsed_path = urlparse(self.path)
@@ -328,6 +362,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if self.reject_untrusted_request():
+            return
+        transcription_match = re.fullmatch(r"/captures/([0-9a-f-]{36})/transcription", self.path)
+        if transcription_match:
+            try:
+                if not transcription_enabled():
+                    self.send_json(409, {"error": "Capture transcription is disabled"})
+                    return
+                if self.capture_json() != {}:
+                    raise CaptureError(400, "Expected an empty transcription start request")
+                manifest = capture_store(DATA_DIR / "captures").get(transcription_match[1])
+                if manifest["status"] == "aborted":
+                    raise CaptureError(409, "Interrupted captures require separate inspection")
+                wake_transcription(manifest)
+                self.send_json(202, {"id": manifest["id"], "status": "scheduled"})
+            except CaptureError as error:
+                self.capture_error(error)
             return
         if self.path == "/captures" or self.path.startswith("/captures/"):
             self.capture_post()

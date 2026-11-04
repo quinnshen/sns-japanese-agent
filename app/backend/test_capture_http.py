@@ -77,11 +77,58 @@ class CaptureHTTPTests(unittest.TestCase):
         handler = self.handler("/health")
         handler.do_GET()
         handler.send_json.assert_called_once_with(200, {
-            "ok": True, "capabilities": {"capture_batches": True, "cloud_processing": False},
+            "ok": True, "capabilities": {"capture_batches": True, "cloud_processing": False, "capture_transcription": False},
         })
         status, _ = self.post("/jobs", {})
         self.assertEqual(status, 409)
         self.assertFalse(self.root.joinpath("captures").exists())
+
+    def test_transcription_start_requires_explicit_enable_and_trusted_origin(self):
+        self.create()
+        path = f"/captures/{self.capture_id}/transcription"
+        with patch("capture_transcription.request_processing") as schedule:
+            self.assertEqual(self.post(path, {})[0], 409)
+            schedule.assert_not_called()
+            with patch.object(server, "setting", lambda name, default=None: "1" if name == "ENABLE_CAPTURE_TRANSCRIPTION" else default):
+                self.assertEqual(self.post(path, {"unexpected": True})[0], 400)
+                self.assertEqual(self.post(path, {})[0], 202)
+                schedule.assert_called_once()
+                untrusted = self.handler(path, headers={"Origin": "https://example.invalid"})
+                untrusted.do_POST()
+                self.assertEqual(untrusted.send_json.call_args.args[0], 403)
+                self.assertEqual(schedule.call_count, 1)
+        handler = self.handler(path)
+        handler.do_GET()
+        self.assertEqual(handler.send_json.call_args.args[1]["status"], "not_started")
+
+    def test_enabled_batch_ack_precedes_asynchronous_transcription_scheduling(self):
+        self.create()
+        events = []
+        handler = self.handler(f"/captures/{self.capture_id}/batches/0", body=b"audio", headers={
+            "Content-Type": "audio/webm", "X-Batch-SHA256": hashlib.sha256(b"audio").hexdigest(),
+            "X-Capture-Start-Ms": "0", "X-Capture-End-Ms": "5000",
+        })
+        handler.send_json.side_effect = lambda *_: events.append("ack")
+        with patch.object(server, "setting", lambda name, default=None: "1" if name == "ENABLE_CAPTURE_TRANSCRIPTION" else default), \
+             patch("capture_transcription.request_processing", side_effect=lambda *_args, **_kwargs: events.append("scheduled")):
+            handler.do_PUT()
+        self.assertEqual(events, ["ack", "scheduled"])
+        self.assertEqual(server.capture_store(self.root / "captures").get(self.capture_id)["received_batches"], 1)
+
+    def test_lost_ack_still_schedules_and_scheduler_failure_does_not_rewrite_ack(self):
+        manifest = {"id": self.capture_id, "status": "complete"}
+        handler = self.handler("/captures")
+        handler.send_json.side_effect = BrokenPipeError()
+        with patch.object(server, "wake_transcription") as schedule:
+            with self.assertRaises(BrokenPipeError):
+                handler.acknowledge_capture(manifest, manifest)
+            schedule.assert_called_once_with(manifest)
+        handler = self.handler("/captures")
+        handler.log_message = Mock()
+        with patch.object(server, "wake_transcription", side_effect=RuntimeError("synthetic scheduler failure")):
+            handler.acknowledge_capture(manifest, manifest)
+        handler.send_json.assert_called_once_with(200, manifest)
+        handler.log_message.assert_called_once()
 
     def test_create_duplicate_missing_completion_and_byte_range_playback(self):
         original = self.create()

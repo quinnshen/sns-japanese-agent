@@ -8,6 +8,7 @@ const extensionId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const origin = `chrome-extension://${extensionId}/`;
 const videoUrl = "https://www.youtube.com/watch?v=AbCdEf012_-";
 const tab = { id: 7, url: videoUrl };
+const pageMetadata = { ok: true, version: "0.4.3", protocol: 1 };
 const tick = async () => { for (let i = 0; i < 120; i++) await Promise.resolve(); };
 async function until(check) { for (let i = 0; i < 20; i++) { if (check()) return; await tick(); } assert.ok(check(), "Lifecycle did not reach expected state"); }
 function deferred() { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; }
@@ -19,15 +20,20 @@ function clock() {
     fire(ms) { const item = [...timers].find(([, timer]) => timer.ms === ms); assert.ok(item, `Missing ${ms}ms deadline`); timers.delete(item[0]); item[1].fn(); },
   };
 }
-function workerHarness({ initial, documentExists = false, inspect = { ok: true, phase: "ready" }, streamId, stallAbort = false } = {}) {
+function workerHarness({ initial, documentExists = false, inspect = { ok: true, phase: "ready" }, streamId, stallAbort = false,
+  transcriptionEnabled = false, transcriptionReply = {}, injectionResults = [{ frameId: 0, result: pageMetadata }],
+  handshakeReply = pageMetadata, statusUnavailable = false } = {}) {
   const timer = clock(); let action; let listener; let stored = initial; let contexts = documentExists;
-  let serial = 0; let closeCount = 0; let streamCalls = 0;
-  const pageMessages = []; const offscreenMessages = [];
+  let serial = 0; let closeCount = 0; let streamCalls = 0; let createCount = 0; let contextCalls = 0;
+  const pageMessages = []; const offscreenMessages = []; const fetches = [];
+  const injections = []; const badges = []; const titles = []; const lifecycle = []; const pageTargets = [];
   const chrome = {
-    action: { onClicked: { addListener(fn) { action = fn; } }, async setBadgeText() {}, async setBadgeBackgroundColor() {} },
+    action: { onClicked: { addListener(fn) { action = fn; } },
+      async setBadgeText(value) { badges.push(structuredClone(value)); }, async setBadgeBackgroundColor() {},
+      async setTitle(value) { titles.push(structuredClone(value)); } },
     runtime: {
       id: extensionId, getURL: (path) => origin + path,
-      async getContexts() { return contexts ? [{}] : []; },
+      async getContexts() { contextCalls++; return contexts ? [{}] : []; },
       onMessage: { addListener(fn) { listener = fn; } },
       async sendMessage(message) {
         offscreenMessages.push(structuredClone(message));
@@ -41,20 +47,38 @@ function workerHarness({ initial, documentExists = false, inspect = { ok: true, 
       async set(value) { stored = structuredClone(value.activeCapture); },
       async remove() { stored = undefined; },
     } },
-    scripting: { async executeScript() {} },
-    offscreen: { async createDocument() { contexts = true; }, async closeDocument() { contexts = false; closeCount++; } },
-    tabCapture: { async getMediaStreamId() { streamCalls++; return streamId ? streamId(streamCalls) : "synthetic-stream"; } },
+    scripting: { async executeScript(value) {
+      lifecycle.push("inject"); injections.push(structuredClone(value));
+      return typeof injectionResults === "function" ? injectionResults() : structuredClone(injectionResults);
+    } },
+    offscreen: { async createDocument() { lifecycle.push("create-offscreen"); contexts = true; createCount++; }, async closeDocument() { contexts = false; closeCount++; } },
+    tabCapture: { async getMediaStreamId() { lifecycle.push("stream"); streamCalls++; return streamId ? streamId(streamCalls) : "synthetic-stream"; } },
     tabs: {
       async get() { return tab; }, async create() {}, onRemoved: { addListener() {} },
-      async sendMessage(_id, message) { pageMessages.push(structuredClone(message)); return { ok: true }; },
+      async sendMessage(tabId, message, options) {
+        pageMessages.push(structuredClone(message)); pageTargets.push({ tabId, options: structuredClone(options) });
+        if (message.type === "page-handshake") {
+          lifecycle.push("handshake");
+          return typeof handshakeReply === "function" ? handshakeReply() : structuredClone(handshakeReply);
+        }
+        if (statusUnavailable && message.type === "status") throw new Error("Receiving end does not exist.");
+        return { ok: true };
+      },
     },
   };
   const context = vm.createContext({ chrome, URL, AbortController, ...timer, crypto: { randomUUID() { return `00000000-0000-4000-8000-${String(++serial).padStart(12, "0")}`; } },
-    async fetch() { return { ok: true, async json() { return { capabilities: { capture_batches: true } }; } }; },
+    async fetch(url) {
+      lifecycle.push("fetch"); fetches.push(url);
+      return { ok: true, async json() {
+        return url.endsWith("/health") ? { capabilities: { capture_batches: true, capture_transcription: transcriptionEnabled } } : transcriptionReply;
+      } };
+    },
   });
   vm.runInContext(workerSource, context);
-  return { timer, pageMessages, offscreenMessages, click: () => action(tab), get stored() { return stored; }, get closeCount() { return closeCount; }, get streamCalls() { return streamCalls; },
-    message: (payload) => new Promise((resolve) => { listener({ target: "worker", ...payload }, { id: extensionId, tab, frameId: 0 }, resolve); }),
+  return { timer, pageMessages, offscreenMessages, fetches, injections, badges, titles, lifecycle, pageTargets,
+    click: () => action(tab), get stored() { return stored; }, get closeCount() { return closeCount; }, get streamCalls() { return streamCalls; },
+    get createCount() { return createCount; }, get contextCalls() { return contextCalls; },
+    message: (payload, senderOverride = {}) => new Promise((resolve) => { listener({ target: "worker", ...payload }, { id: extensionId, tab, frameId: 0, ...senderOverride }, resolve); }),
   };
 }
 {
@@ -158,4 +182,191 @@ function mediaHarness({ acquisition, resume } = {}) {
   await h.dispatch("capture-abort", "second");
   console.log("PASS suspended audio output fails with a bounded deadline and releases capture resources");
 }
-console.log("7 preparation and failure lifecycle checks passed.");
+{
+  for (const enabled of [false, true]) {
+    const h = workerHarness({ transcriptionEnabled: enabled });
+    h.click(); await until(() => h.pageMessages.some((m) => m.type === "status" && m.text.startsWith("选择采集范围")));
+    assert.equal(h.stored.transcriptionEnabled, enabled);
+    assert.equal(h.pageMessages.find((m) => m.type === "capture-configuring").transcriptionEnabled, enabled);
+    assert.equal(h.pageMessages.find((m) => m.type === "capture-configure").transcriptionEnabled, enabled);
+    const ready = h.pageMessages.filter((m) => m.type === "status").at(-1).text;
+    assert.equal(ready.includes("分批发送 Google"), enabled);
+    const id = h.stored.sessionId;
+    assert.equal((await h.message({ type: "capture-complete", sessionId: id, manifest: { id } },
+      { tab: undefined, url: origin + "offscreen.html" })).ok, true);
+    const saved = h.pageMessages.find((m) => m.type === "capture-saved");
+    assert.equal(saved.transcriptionEnabled, enabled);
+    const complete = h.pageMessages.filter((m) => m.type === "status").at(-1).text;
+    assert.equal(complete.includes("此次未调用 Google 或 GPT"), !enabled);
+    assert.equal(complete.includes("Google 转写在后台"), enabled);
+    assert.deepEqual(h.fetches.map((url) => new URL(url).pathname), ["/health"]);
+  }
+  console.log("PASS capture-only and Google-enabled readiness/completion messages match actual capability flags");
+}
+{
+  const captureId = "00000000-0000-4000-8000-000000000099";
+  const h = workerHarness({ transcriptionReply: {
+    status: "needs_attention", windows_done: 2, windows_total: 3, sentences: 8,
+    blocked_windows: [{ status: "unknown", secret: "synthetic-private-marker" }],
+    result: { raw_transcripts: [{ text: "synthetic-private-marker" }], sentences: [{ text: "漢字" }] },
+    error: "synthetic-private-marker",
+  } });
+  const response = await h.message({ type: "capture-transcription-status", captureId });
+  assert.deepEqual(Object.keys(response.transcription).sort(), ["status", "windows_done", "windows_total", "sentences", "unknown_windows", "failed_windows"].sort());
+  assert.equal(response.transcription.unknown_windows, 1);
+  assert.equal(response.transcription.sentences, 8);
+  assert.equal(JSON.stringify(response).includes("synthetic-private-marker"), false);
+  assert.equal(JSON.stringify(response).includes("漢字"), false);
+  assert.equal(h.fetches.length, 1);
+  for (const [payload, sender] of [
+    [{ captureId: "../invalid" }, {}], [{ captureId }, { frameId: 1 }],
+    [{ captureId }, { id: "untrusted-extension" }],
+    [{ captureId }, { tab: { id: 7, url: "https://example.invalid" } }],
+  ]) {
+    const rejected = await h.message({ type: "capture-transcription-status", ...payload }, sender);
+    assert.equal(rejected.ok, false);
+  }
+  assert.equal(h.fetches.length, 1, "Invalid senders or identifiers must never reach the local status API");
+  console.log("PASS status requests validate sender and UUID, and forward only safe counts without ASR text");
+}
+{
+  const h = workerHarness({ transcriptionReply: { status: "running", windows_done: 1, windows_total: 3, sentences: 4 } });
+  const response = await h.message({ type: "capture-transcription-status", captureId: "00000000-0000-4000-8000-000000000099" });
+  assert.equal(response.transcription.status, "running");
+  assert.equal(response.transcription.windows_done, 1);
+  console.log("PASS an in-flight window remains a running status instead of a terminal error");
+}
+function assertRefreshRequired(h) {
+  assert.equal(h.badges.at(-1)?.text, "ERR");
+  assert.match(h.titles.at(-1)?.title || "", /刷新当前 YouTube 页面/,
+    "The action tooltip must explain recovery even when the page cannot show a status");
+  assert.equal(h.fetches.length, 0, "An unverified page must not connect to the local backend");
+  assert.equal(h.contextCalls, 0, "Page verification must precede offscreen setup or inspection");
+  assert.equal(h.createCount, 0);
+  assert.equal(h.streamCalls, 0);
+  assert.equal(h.offscreenMessages.length, 0, "An unverified page must not arm, inspect, or release a recording queue");
+}
+function assertDiagnostic(h, code) {
+  assertRefreshRequired(h);
+  assert.ok(h.titles.at(-1).title.includes(`[${code}]`), `The action tooltip must identify ${code}`);
+  assert.equal(h.titles.at(-1).title.includes("synthetic-private-marker"), false,
+    "Raw injection errors or unknown result values must not enter user-visible diagnostics");
+}
+{
+  for (const [injectionResults, code] of [
+    [() => undefined, "missing_main_frame"],
+    [[{ frameId: 0, result: { ok: false, requiresRefresh: true } }], "injection_invalid_result"],
+    [[{ frameId: 0, result: { ...pageMetadata, version: "0.4.2" } }], "injection_version_mismatch"],
+    [[{ frameId: 0, result: { ...pageMetadata, protocol: 2 } }], "injection_protocol_mismatch"],
+    [[{ frameId: 1, result: pageMetadata }], "missing_main_frame"],
+    [[{ frameId: 0 }], "missing_injection_result"],
+  ]) {
+    const h = workerHarness({ injectionResults, statusUnavailable: true });
+    h.click(); await tick();
+    assertDiagnostic(h, code);
+    assert.equal(h.injections.length, 1);
+    assert.equal(h.pageMessages.some((message) => message.type === "page-handshake"), false);
+    assert.equal(h.stored, undefined);
+  }
+  console.log("PASS missing, stale, or non-main-frame injection results require refresh before backend or audio access");
+}
+{
+  for (const [handshakeReply, code] of [
+    [undefined, "handshake_empty"], [null, "handshake_empty"],
+    [{ ok: true }, "handshake_version_mismatch"],
+    [{ ...pageMetadata, version: "0.4.2" }, "handshake_version_mismatch"],
+    [{ ...pageMetadata, protocol: 2 }, "handshake_protocol_mismatch"],
+    [{ ...pageMetadata, ok: false }, "handshake_invalid_result"],
+    [() => { throw new Error("synthetic-private-marker: receiving end does not exist"); }, "handshake_throw"],
+  ]) {
+    // An explicit function permits testing an absent response without activating the harness default.
+    const h = workerHarness({ handshakeReply: handshakeReply === undefined ? () => undefined : handshakeReply });
+    h.click(); await tick();
+    assertDiagnostic(h, code);
+    assert.equal(h.pageMessages.filter((message) => message.type === "page-handshake").length, 1);
+    assert.deepEqual(h.pageTargets[0], { tabId: tab.id, options: { frameId: 0 } });
+    assert.equal(h.stored, undefined);
+  }
+  console.log("PASS missing or mismatched live handshakes fail closed and address only the main frame");
+}
+{
+  const pending = deferred();
+  const h = workerHarness({ handshakeReply: () => pending.promise });
+  h.click(); await until(() => h.pageMessages.some((message) => message.type === "page-handshake"));
+  h.timer.fire(3000); await tick();
+  assertDiagnostic(h, "handshake_timeout");
+  pending.resolve(pageMetadata); await tick();
+  assertRefreshRequired(h);
+  assert.equal(h.stored, undefined, "A late handshake must not restart timed-out initialization");
+  console.log("PASS a stuck handshake expires after three seconds and a late reply cannot prepare audio");
+}
+{
+  const h = workerHarness();
+  h.click(); await until(() => h.stored?.phase === "ready");
+  assert.deepEqual(h.lifecycle.slice(0, 3), ["inject", "handshake", "fetch"]);
+  assert.equal(h.injections.length, 1);
+  assert.deepEqual(h.injections[0], { target: { tabId: tab.id }, files: ["page.js"] });
+  assert.equal(h.pageMessages[0].type, "page-handshake");
+  assert.equal(h.pageMessages[0].version, pageMetadata.version);
+  assert.equal(h.pageMessages[0].protocol, pageMetadata.protocol);
+  assert.equal(h.createCount, 1);
+  assert.equal(h.streamCalls, 1);
+  assert.equal(h.titles.at(-1)?.title.includes("刷新当前"), false,
+    "Normal readiness must reset an earlier action tooltip");
+  console.log("PASS verified current page code completes its handshake before normal capture preparation");
+}
+{
+  const previous = { tabId: tab.id, sourceUrl: videoUrl, sessionId: "00000000-0000-4000-8000-000000000099", phase: "failed" };
+  const h = workerHarness({ initial: previous, documentExists: true,
+    injectionResults: [{ frameId: 0, result: { ok: false, requiresRefresh: true } }] });
+  h.click(); await tick();
+  assertRefreshRequired(h);
+  assert.deepEqual(h.stored, previous);
+  assert.equal(h.closeCount, 0, "Page verification failure must preserve an existing recording queue");
+  console.log("PASS a stale page leaves existing capture storage and unacknowledged audio untouched");
+}
+{
+  for (const reason of ["legacy_controller", "controller_version_mismatch", "dead_controller", "orphan_root", "context_invalid"]) {
+    const h = workerHarness({ injectionResults: [{ frameId: 0, result: { ok: false, reason } }] });
+    h.click(); await tick();
+    assertDiagnostic(h, reason);
+    assert.equal(h.pageMessages.some((message) => message.type === "page-handshake"), false);
+  }
+  for (const reason of ["synthetic-private-marker", "__proto__", "constructor"]) {
+    const h = workerHarness({ injectionResults: [{ frameId: 0, result: { ok: false, reason } }] });
+    h.click(); await tick();
+    assertDiagnostic(h, "injection_invalid_result");
+  }
+  console.log("PASS controller failure reasons are preserved only through a fixed diagnostic allowlist");
+}
+{
+  const h = workerHarness({ injectionResults: () => { throw new Error("synthetic-private-marker: cannot load private path"); } });
+  h.click(); await tick();
+  assertDiagnostic(h, "inject_throw");
+  assert.equal(h.pageMessages.some((message) => message.type === "page-handshake"), false);
+  console.log("PASS injection rejection identifies its stage without exposing the raw browser exception");
+}
+{
+  const pending = deferred();
+  const h = workerHarness({ injectionResults: () => pending.promise });
+  h.click(); await until(() => h.injections.length === 1);
+  h.timer.fire(3000); await tick();
+  assertDiagnostic(h, "inject_timeout");
+  pending.resolve([{ frameId: 0, result: pageMetadata }]); await tick();
+  assertDiagnostic(h, "inject_timeout");
+  assert.equal(h.pageMessages.some((message) => message.type === "page-handshake"), false);
+  console.log("PASS injection timeout differs from rejection and late results cannot continue setup");
+}
+{
+  let ready = false;
+  const h = workerHarness({ injectionResults: () => [{ frameId: 0, result: ready ? pageMetadata : { ok: false, reason: "orphan_root" } }] });
+  h.click(); await tick();
+  assertDiagnostic(h, "orphan_root");
+  ready = true;
+  h.click(); await until(() => h.stored?.phase === "ready");
+  assert.equal(h.badges.at(-1).text, "JA");
+  assert.equal(h.titles.at(-1).title.includes("[orphan_root]"), false);
+  assert.equal(h.streamCalls, 1);
+  console.log("PASS a later valid action clears an earlier diagnostic and prepares exactly one capture");
+}
+console.log("19 preparation, handshake, diagnostic, status, and failure lifecycle checks passed.");

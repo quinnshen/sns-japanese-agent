@@ -6,6 +6,7 @@ import vm from "node:vm";
 const source = await readFile(new URL("../app/extension/page.js", import.meta.url), "utf8");
 const sessionId = "00000000-0000-4000-8000-000000000001";
 const extensionId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const rootId = `sns-japanese-agent-root-${extensionId}`;
 const flush = async () => { for (let count = 0; count < 12; count++) await Promise.resolve(); };
 
 class FakeElement {
@@ -75,13 +76,16 @@ class FakeElement {
   getBoundingClientRect() { return { top: 0, left: 0, right: 640, bottom: 360 }; }
 }
 
-function harness({ duration = NaN, pendingPlay = false, failBegin = false, shorts = false } = {}) {
+function harness({ duration = NaN, pendingPlay = false, failBegin = false, shorts = false, transcriptionEnabled = false, statusReplies = [], foreignPanel = false } = {}) {
   const timers = new Map();
   const messages = [];
   let time = 0;
   let nextTimer = 1;
   let listener;
   let releasePlay;
+  let statusCalls = 0;
+  let runtimeFailure;
+  let runtimeFailures = 0;
   const video = new FakeElement("video");
   Object.assign(video, {
     duration, currentTime: 0, paused: true, ended: false, seeking: false, loop: false,
@@ -107,6 +111,7 @@ function harness({ duration = NaN, pendingPlay = false, failBegin = false, short
   const document = {
     documentElement: new FakeElement("html"),
     createElement: (name) => new FakeElement(name),
+    getElementById(id) { return this.documentElement.querySelector(`#${id}`); },
     querySelector(selector) {
       if (selector === "ytd-reel-video-renderer[is-active]") return shorts ? activeShorts : null;
       if (selector === "#movie_player") return player;
@@ -118,12 +123,42 @@ function harness({ duration = NaN, pendingPlay = false, failBegin = false, short
     querySelectorAll: (selector) => selector === "video" ? [...previews, ...player.children] : [],
   };
   document.documentElement.append(shorts ? activeShorts : player, unrelatedPlayer);
+  let foreignRoot;
+  if (foreignPanel) {
+    foreignRoot = new FakeElement("div");
+    foreignRoot.id = "sns-japanese-agent-root";
+    document.documentElement.append(foreignRoot);
+  }
   const location = { href: shorts ? "https://www.youtube.com/shorts/AbCdEf012_-" : "https://www.youtube.com/watch?v=AbCdEf012_-" };
   const setTimer = (fn, delay, interval = false) => {
     const id = nextTimer++;
     timers.set(id, { fn, at: time + delay, interval: interval ? delay : 0 });
     return id;
   };
+  const runtime = {
+    id: extensionId,
+    onMessage: { addListener(fn) { listener = fn; } },
+    // Keep this entry point synchronous so a throw before a Promise exists is tested.
+    sendMessage(message) {
+      messages.push(structuredClone(message));
+      if (runtimeFailure && (!runtimeFailure.type || runtimeFailure.type === message.type)) {
+        runtimeFailures++;
+        const error = new Error("Extension context invalidated.");
+        if (runtimeFailure.mode === "async") return Promise.reject(error);
+        throw error;
+      }
+      return replyToMessage(message);
+    },
+  };
+  async function replyToMessage(message) {
+    if (failBegin && message.type === "capture-begin") throw new Error("Synthetic startup failure");
+    if (message.type === "capture-transcription-status") {
+      const reply = statusReplies[statusCalls++] ?? { status: "waiting_for_audio", windows_done: 0, windows_total: 0, sentences: 0 };
+      const value = typeof reply === "function" ? await reply() : await reply;
+      return { ok: true, transcription: value };
+    }
+    return { ok: true };
+  }
   const context = vm.createContext({
     window: {}, document, location, URL, Number, Error, Promise,
     innerHeight: 1000, innerWidth: 1200,
@@ -132,18 +167,10 @@ function harness({ duration = NaN, pendingPlay = false, failBegin = false, short
     HTMLMediaElement: { HAVE_NOTHING: 0, HAVE_METADATA: 1, HAVE_CURRENT_DATA: 2, HAVE_FUTURE_DATA: 3, HAVE_ENOUGH_DATA: 4 },
     setTimeout: (fn, delay) => setTimer(fn, delay), clearTimeout: (id) => timers.delete(id),
     setInterval: (fn, delay) => setTimer(fn, delay, true), clearInterval: (id) => timers.delete(id),
-    chrome: { runtime: {
-      id: extensionId,
-      onMessage: { addListener(fn) { listener = fn; } },
-      async sendMessage(message) {
-        messages.push(structuredClone(message));
-        if (failBegin && message.type === "capture-begin") throw new Error("Synthetic startup failure");
-        return { ok: true };
-      },
-    } },
+    chrome: { runtime },
   });
-  vm.runInContext(source, context);
-  const root = document.documentElement.children.find((element) => element.id === "sns-japanese-agent-root");
+  const injectionResult = vm.runInContext(source, context);
+  const root = document.documentElement.children.find((element) => element.id === rootId);
   assert.ok(root?.shadowRoot, "The actual page script must render its panel");
   const elements = [];
   const visit = (element) => { elements.push(element); element.children.forEach(visit); };
@@ -151,6 +178,8 @@ function harness({ duration = NaN, pendingPlay = false, failBegin = false, short
   const begin = elements.find((element) => element.tagName === "BUTTON" && element.textContent === "开始采集");
   const cancel = elements.find((element) => element.tagName === "BUTTON" && element.textContent === "中断／释放音频");
   const inputs = elements.filter((element) => element.tagName === "INPUT");
+  const close = elements.find((element) => element.tagName === "BUTTON" && element.textContent === "×");
+  const transcription = elements.find((element) => element.className === "transcription-status");
   const status = elements.find((element) => element.className === "status");
   assert.ok(begin && cancel && status && inputs.length === 3);
   const dispatch = (type, payload = {}) => new Promise((resolve) => {
@@ -178,13 +207,26 @@ function harness({ duration = NaN, pendingPlay = false, failBegin = false, short
   const metadataListeners = () => ["loadedmetadata", "durationchange", "error", "emptied"]
     .reduce((count, type) => count + (video.listeners.get(type) || []).length, 0);
   return {
-    video, messages, location, begin, cancel, inputs, status, dispatch, advance, metadataListeners,
+    video, messages, location, begin, cancel, close, inputs, status, transcription, dispatch, advance, metadataListeners,
+    injectionResult,
+    reinject: () => vm.runInContext(source, context),
+    forgetPageMarker: () => { delete context.window.__snsJapaneseAgentPage; },
+    get panelCount() { return document.documentElement.children.filter((element) => element.id === rootId).length; },
+    get foreignPanelConnected() { return foreignRoot?.isConnected === true && foreignRoot.parentElement === document.documentElement; },
+    get panelVersion() { return elements.find((element) => element.className === "version")?.textContent; },
+    get statusCalls() { return statusCalls; },
+    get timerCount() { return timers.size; },
+    get runtimeFailures() { return runtimeFailures; },
+    invalidateContext({ clearId = true, mode = "sync", type } = {}) {
+      if (clearId) runtime.id = undefined;
+      runtimeFailure = { mode, type };
+    },
     get player() { return player; }, unrelatedPlayer, previews,
     replacePlayer(replacement) { player = replacement; },
     releasePlay: () => releasePlay?.(),
     async configure() {
-      await dispatch("capture-configuring");
-      return dispatch("capture-configure");
+      await dispatch("capture-configuring", { transcriptionEnabled });
+      return dispatch("capture-configure", { transcriptionEnabled });
     },
   };
 }
@@ -369,4 +411,220 @@ for (const kind of ["identity", "ad", "detached", "replacement"]) {
   assert.equal(h.messages.find((m) => m.type === "page-error").failure.code, "advertisement_started");
   console.log("PASS an advertisement time jump cannot falsely complete the selected capture range");
 }
-console.log("15 offline page lifecycle checks passed.");
+{
+  const h = await recording();
+  await h.advance(5000);
+  assert.equal(h.statusCalls, 0);
+  assert.equal(h.transcription.hidden, true);
+  await h.dispatch("capture-stop-playback");
+  console.log("PASS capture-only mode never polls or advertises Google transcription");
+}
+{
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  const h = await recording({ transcriptionEnabled: true, statusReplies: [pending,
+    { status: "complete", windows_done: 3, windows_total: 3, sentences: 12 }] });
+  assert.equal(h.statusCalls, 1);
+  await h.advance(5000);
+  assert.equal(h.statusCalls, 1, "Only one status request may be in flight");
+  release({ status: "waiting_for_audio", windows_done: 1, windows_total: 2, sentences: 4 });
+  await flush();
+  await h.advance(2500);
+  assert.equal(h.statusCalls, 2);
+  assert.match(h.transcription.textContent, /完成.*12/);
+  await h.advance(10000);
+  assert.equal(h.statusCalls, 2, "Completion must stop status polling");
+  await h.dispatch("capture-stop-playback");
+  console.log("PASS enabled status polling is single-flight and stops after count-only completion");
+}
+{
+  const h = await recording({ transcriptionEnabled: true, statusReplies: [
+    { status: "waiting_for_audio", windows_done: 1, windows_total: 2, sentences: 4 },
+    { status: "complete", windows_done: 3, windows_total: 3, sentences: 12, raw_transcript: "unannotated-private-marker" },
+  ] });
+  await h.dispatch("capture-saved", { transcriptionEnabled: true, manifest: {
+    id: sessionId, audio_url: `/captures/${sessionId}/audio`, expected_batches: 60, audio_size_bytes: 2000000,
+  } });
+  await h.dispatch("capture-reset", { complete: true });
+  await h.advance(2500);
+  assert.equal(h.statusCalls, 2);
+  assert.match(h.transcription.textContent, /完成.*12/);
+  assert.equal(h.transcription.textContent.includes("unannotated-private-marker"), false);
+  console.log("PASS saving audio releases capture while Google progress continues without displaying raw Japanese");
+}
+{
+  const h = await recording({ transcriptionEnabled: true, statusReplies: [
+    { status: "needs_attention", windows_done: 1, windows_total: 2, sentences: 4, unknown_windows: 1 },
+  ] });
+  await h.advance(5000);
+  assert.equal(h.statusCalls, 1);
+  assert.match(h.transcription.textContent, /结果未知.*不会自动重试/);
+  await h.dispatch("capture-stop-playback");
+  console.log("PASS unknown request outcomes stop polling and require local inspection without paid retry");
+}
+for (const action of ["cancel", "close"]) {
+  const h = await recording({ transcriptionEnabled: true });
+  h[action].click();
+  await flush();
+  await h.advance(5000);
+  assert.equal(h.statusCalls, 1);
+  await h.dispatch("capture-stop-playback");
+}
+console.log("PASS cancellation and panel closure stop background status polling");
+
+function assertInvalidated(h) {
+  assert.match(h.status.textContent, /刷新当前 YouTube 页面/);
+  assert.equal(h.begin.disabled, true);
+  assert.equal(h.cancel.disabled, true);
+  assert.ok(h.inputs.every((input) => input.disabled));
+  assert.equal(h.transcription.hidden, true);
+  assert.equal(h.timerCount, 0, "An invalidated page must release all preparation, playback, and polling timers");
+  return h.status.textContent;
+}
+for (const mode of ["sync", "async"]) {
+  const h = harness({ duration: 120 });
+  assert.equal((await h.configure()).ok, true);
+  h.invalidateContext({ clearId: false, mode, type: "capture-begin" });
+  assert.doesNotThrow(() => h.begin.click());
+  await flush();
+  assert.equal(h.runtimeFailures, 1, "The sendMessage failure must occur while runtime.id still exists");
+  const notice = assertInvalidated(h);
+  h.begin.click();
+  await h.advance(9000);
+  assert.equal(h.runtimeFailures, 1);
+  assert.equal(h.status.textContent, notice, "The ordinary startup failure handler must not overwrite the refresh notice");
+  console.log(`PASS ${mode} context invalidation during startup disables stale controls without an uncaught error`);
+}
+{
+  const h = harness({ duration: 120 });
+  assert.equal((await h.configure()).ok, true);
+  h.invalidateContext({ clearId: false, type: "capture-cancel" });
+  assert.doesNotThrow(() => h.cancel.click());
+  await flush();
+  assert.equal(h.runtimeFailures, 1);
+  assertInvalidated(h);
+  console.log("PASS cancellation reports safely handle a synchronous invalidated runtime");
+}
+{
+  const h = await recording();
+  h.invalidateContext({ clearId: false, type: "playback-event" });
+  assert.doesNotThrow(() => h.video.emit("waiting"));
+  await flush();
+  assert.equal(h.runtimeFailures, 1);
+  const notice = assertInvalidated(h);
+  assert.equal(h.video.paused, true, "Stale capture playback must stop when the runtime is invalidated");
+  for (const event of ["playing", "waiting", "pause", "seeking", "timeupdate", "ratechange", "ended"]) {
+    assert.equal((h.video.listeners.get(event) || []).length, 0, `The ${event} capture listener must be removed`);
+  }
+  const sent = h.messages.length;
+  await h.advance(9000);
+  assert.equal(h.messages.length, sent, "Waiting callbacks must not recreate a stall timer or send later errors");
+  assert.equal(h.status.textContent, notice);
+  assert.equal(h.timerCount, 0);
+  console.log("PASS synchronous playback-report invalidation removes listeners and cannot recreate delayed work");
+}
+{
+  let rejectStatus;
+  const pending = new Promise((_, reject) => { rejectStatus = reject; });
+  const h = await recording({ transcriptionEnabled: true, statusReplies: [pending] });
+  assert.equal(h.statusCalls, 1);
+  rejectStatus(new Error("Extension context invalidated."));
+  await flush();
+  const notice = assertInvalidated(h);
+  assert.equal(h.video.paused, true);
+  const sent = h.messages.length;
+  await h.advance(10000);
+  assert.equal(h.statusCalls, 1);
+  assert.equal(h.messages.length, sent);
+  assert.equal(h.status.textContent, notice, "Late polling failure handling must preserve the refresh notice");
+  console.log("PASS delayed status rejection invalidates the page and stops future polling without overwriting the notice");
+}
+{
+  const h = harness();
+  let responded = false;
+  void h.configure().then(() => { responded = true; });
+  await flush();
+  assert.ok(h.metadataListeners() > 0);
+  h.invalidateContext();
+  await h.advance(200);
+  const notice = assertInvalidated(h);
+  assert.equal(h.metadataListeners(), 0);
+  h.video.duration = 120;
+  h.video.emit("loadedmetadata");
+  await h.advance(9000);
+  assert.equal(h.status.textContent, notice);
+  assert.equal(h.begin.disabled, true);
+  assert.equal(responded, false, "The old context must not respond to its abandoned configuration request");
+  console.log("PASS runtime removal cancels metadata preparation and late readiness cannot revive the page");
+}
+{
+  const h = harness({ duration: 120 });
+  assert.equal((await h.configure()).ok, true);
+  let responded = false;
+  void h.dispatch("prepare", { rangeStart: 30, rangeEnd: 90, batchIntervalMs: 5000 }).then(() => { responded = true; });
+  await flush();
+  assert.equal((h.video.listeners.get("seeked") || []).length, 1);
+  h.invalidateContext();
+  assert.doesNotThrow(() => h.cancel.click());
+  await flush();
+  const notice = assertInvalidated(h);
+  assert.equal((h.video.listeners.get("seeked") || []).length, 0);
+  h.video.emit("seeked");
+  await h.advance(9000);
+  assert.equal(h.status.textContent, notice);
+  assert.equal(responded, false, "The old context must not respond to its abandoned seek request");
+  assert.equal(h.messages.some((message) => message.type === "capture-cancel"), false,
+    "Cancellation after runtime removal must not attempt to contact the dead worker");
+  console.log("PASS invalidation during a pending seek releases its listener and timeout without stale responses");
+}
+{
+  const h = await recording();
+  const handshake = await h.dispatch("page-handshake");
+  assert.equal(handshake.ok, true);
+  assert.equal(handshake.version, "0.4.3");
+  assert.equal(handshake.protocol, 1);
+  assert.equal(h.panelVersion, "v0.4.3");
+  assert.equal(h.injectionResult.version, handshake.version);
+  assert.equal(h.reinject().version, handshake.version);
+  assert.equal(h.panelCount, 1);
+  assert.equal(h.video.paused, false, "Repeated injection must preserve a healthy active recording");
+  await h.dispatch("capture-stop-playback");
+  console.log("PASS page injection and handshake identify the visible build without replacing a healthy capture");
+}
+{
+  const h = harness({ duration: 120 });
+  assert.equal((await h.configure()).ok, true);
+  h.invalidateContext();
+  const reply = h.reinject();
+  assert.equal(reply.ok, false);
+  assert.equal(reply.reason, "dead_controller");
+  assert.equal(h.panelCount, 1);
+  assertInvalidated(h);
+  console.log("PASS reinjection refuses a dead page controller instead of silently treating it as initialized");
+}
+{
+  const h = harness({ duration: 120 });
+  h.forgetPageMarker();
+  const reply = h.reinject();
+  assert.equal(reply.ok, false);
+  assert.equal(reply.reason, "orphan_root");
+  assert.equal(h.panelCount, 1, "An orphaned panel from an older isolated world must not be duplicated");
+  console.log("PASS orphaned DOM from an older extension context requires a page reload before capture");
+}
+{
+  const result = vm.runInNewContext(source, { window: { __snsJapaneseAgentPage: true } });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "legacy_controller");
+  console.log("PASS a legacy boolean page marker is recognized as stale instead of falsely reporting readiness");
+}
+{
+  const h = harness({ duration: 120, foreignPanel: true });
+  assert.equal(h.injectionResult.ok, true);
+  assert.equal((await h.configure()).ok, true);
+  assert.equal((await h.dispatch("page-handshake")).version, "0.4.3");
+  assert.equal(h.panelCount, 1);
+  assert.equal(h.foreignPanelConnected, true, "The new extension must not remove another installation's panel");
+  assert.equal(h.begin.disabled, false);
+  console.log("PASS a legacy panel from another extension cannot block the current extension's namespaced panel");
+}
+console.log("32 offline page lifecycle checks passed.");

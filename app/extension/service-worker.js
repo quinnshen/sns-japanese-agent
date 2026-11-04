@@ -1,5 +1,7 @@
 const SESSION_KEY = "activeCapture";
 const API = "http://127.0.0.1:8766";
+const PAGE_VERSION = "0.4.3";
+const PAGE_PROTOCOL = 1;
 let creatingOffscreen;
 let opening = false;
 
@@ -7,7 +9,7 @@ async function within(promise, milliseconds, message) {
   let timer;
   try {
     return await Promise.race([promise, new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error(message)), milliseconds);
+      timer = setTimeout(() => reject(message instanceof Error ? message : new Error(message)), milliseconds);
     })]);
   } finally { clearTimeout(timer); }
 }
@@ -31,9 +33,56 @@ async function ensureOffscreen() {
 const pageMessage = (tabId, payload) => chrome.tabs.sendMessage(tabId, payload);
 const offscreenMessage = (payload) => chrome.runtime.sendMessage({ target: "offscreen", ...payload });
 
+async function ensurePage(tabId) {
+  const failure = (code, text) => new Error(`${text} [${code}] 请刷新当前 YouTube 页面，再点击 SNS 扩展图标。`);
+  const controllerFailures = {
+    legacy_controller: "当前页面仍有旧版扩展脚本。",
+    controller_version_mismatch: "页面控制器与扩展版本不一致。",
+    dead_controller: "当前页面的扩展连接已失效。",
+    orphan_root: "检测到本扩展遗留的界面，但没有有效控制器。",
+    context_invalid: "当前页面的扩展环境已失效。",
+  };
+  let injected;
+  const injectionTimeout = failure("inject_timeout", "页面脚本注入超过 3 秒。");
+  try {
+    injected = await within(chrome.scripting.executeScript({ target: { tabId }, files: ["page.js"] }),
+      3000, injectionTimeout);
+  } catch (error) {
+    if (error === injectionTimeout) throw error;
+    throw failure("inject_throw", "无法将扩展脚本注入当前页面。");
+  }
+  const mainFrame = Array.isArray(injected) && injected.find((frame) => frame?.frameId === 0);
+  if (!mainFrame) throw failure("missing_main_frame", "页面脚本没有返回主页面结果。");
+  const value = mainFrame.result;
+  if (value === undefined || value === null) throw failure("missing_injection_result", "页面脚本未完成初始化，或没有返回初始化结果。");
+  if (value.ok !== true) {
+    if (typeof value.reason === "string" && Object.prototype.hasOwnProperty.call(controllerFailures, value.reason)) {
+      throw failure(value.reason, controllerFailures[value.reason]);
+    }
+    throw failure("injection_invalid_result", "页面脚本返回了无法确认的初始化结果。");
+  }
+  if (value.version !== PAGE_VERSION) throw failure("injection_version_mismatch", "注入的页面脚本与扩展版本不一致。");
+  if (value.protocol !== PAGE_PROTOCOL) throw failure("injection_protocol_mismatch", "注入的页面脚本与扩展通信协议不一致。");
+  let reply;
+  const handshakeTimeout = failure("handshake_timeout", "页面脚本在 3 秒内未响应连接检查。");
+  try {
+    reply = await within(chrome.tabs.sendMessage(tabId, {
+      type: "page-handshake", version: PAGE_VERSION, protocol: PAGE_PROTOCOL,
+    }, { frameId: 0 }), 3000, handshakeTimeout);
+  } catch (error) {
+    if (error === handshakeTimeout) throw error;
+    throw failure("handshake_throw", "无法连接已注入的页面脚本。");
+  }
+  if (reply === undefined || reply === null) throw failure("handshake_empty", "页面脚本没有返回连接检查结果。");
+  if (reply.ok !== true) throw failure("handshake_invalid_result", "页面脚本返回了无效的连接检查结果。");
+  if (reply.version !== PAGE_VERSION) throw failure("handshake_version_mismatch", "响应的页面脚本与扩展版本不一致。");
+  if (reply.protocol !== PAGE_PROTOCOL) throw failure("handshake_protocol_mismatch", "响应的页面脚本与扩展通信协议不一致。");
+}
+
 async function status(tabId, text, error = false) {
   await chrome.action.setBadgeText({ tabId, text: error ? "ERR" : "JA" });
   await chrome.action.setBadgeBackgroundColor({ tabId, color: error ? "#b42318" : "#176b45" });
+  await chrome.action.setTitle({ tabId, title: text });
   await pageMessage(tabId, { type: "status", text, error }).catch(() => {});
 }
 
@@ -59,13 +108,14 @@ async function openAgent(tab) {
   let session;
   try {
     if (!tab.id || !validVideoUrl(tab.url)) throw new Error("请先打开 YouTube 视频或 Shorts 页面。");
+    await ensurePage(tab.id);
     const active = (await chrome.storage.session.get(SESSION_KEY))[SESSION_KEY];
     if (active) {
       const contexts = await within(chrome.runtime.getContexts({
         contextTypes: ["OFFSCREEN_DOCUMENT"], documentUrls: [chrome.runtime.getURL("offscreen.html")],
       }), 3000, "检查采集环境超时");
       if (contexts.length) {
-        await chrome.scripting.executeScript({ target: { tabId: active.tabId }, files: ["page.js"] });
+        if (active.tabId !== tab.id) await ensurePage(active.tabId);
         await pageMessage(active.tabId, { type: "capture-show" }).catch(() => {});
         if (active.tabId !== tab.id) await status(tab.id, "另一个标签页已有采集任务，请先结束该任务。", true);
         else {
@@ -80,7 +130,9 @@ async function openAgent(tab) {
             active.phase = "ready";
             await checkCurrent(active);
             await chrome.storage.session.set({ [SESSION_KEY]: active });
-            await status(tab.id, "音频已准备。选择范围后点击开始；尚未录音。");
+            await status(tab.id, active.transcriptionEnabled
+              ? "音频已准备。选择范围后点击开始；开始采集后将分批发送 Google 转写。"
+              : "音频已准备。选择范围后点击开始；尚未录音。");
           } else if (inspected?.ok && inspected.phase === "failed") {
             await pageMessage(tab.id, { type: "capture-failed", sessionId: active.sessionId }).catch(() => {});
             await status(tab.id, `上次采集已停止，待确认 ${inspected.pendingBatches || 0} 批仍保留；请点击中断按钮明确释放后重试。`, true);
@@ -93,7 +145,6 @@ async function openAgent(tab) {
       // No offscreen document means its in-memory queue is already gone; keep disk batches untouched.
       await chrome.storage.session.remove(SESSION_KEY);
     }
-    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["page.js"] });
     await status(tab.id, "正在连接本机采集服务…");
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5000);
@@ -104,7 +155,8 @@ async function openAgent(tab) {
       health = await response.json();
     } finally { clearTimeout(timeout); }
     if (!health.capabilities?.capture_batches) throw new Error("请启动支持分批采集的新版本本机后端。");
-    session = { tabId: tab.id, sessionId: crypto.randomUUID(), sourceUrl: tab.url, phase: "preparing" };
+    session = { tabId: tab.id, sessionId: crypto.randomUUID(), sourceUrl: tab.url, phase: "preparing",
+      transcriptionEnabled: health.capabilities?.capture_transcription === true };
     await chrome.storage.session.set({ [SESSION_KEY]: session });
     await pageMessage(tab.id, { type: "capture-configuring", ...session });
     await status(tab.id, "正在准备音频采集环境…若视频尚未加载，请先让它正常播放。");
@@ -130,7 +182,9 @@ async function openAgent(tab) {
     await checkCurrent(session);
     session.phase = "ready";
     await chrome.storage.session.set({ [SESSION_KEY]: session });
-    await status(tab.id, "选择采集范围和上传间隔，再点击开始。尚未录音，不调用云端服务。");
+    await status(tab.id, session.transcriptionEnabled
+      ? "选择采集范围和上传间隔，再点击开始。开始采集后将分批发送 Google 转写，不调用 GPT。"
+      : "选择采集范围和上传间隔，再点击开始。尚未录音，不调用云端服务。");
   } catch (error) {
     if (tab.id) await status(tab.id, `准备失败：${error.message}`, true);
     if (session) {
@@ -217,8 +271,11 @@ async function handleMessage(message, sender) {
       await pageMessage(session.tabId, { type: "capture-progress", sessionId: session.sessionId, progress: message.progress }).catch(() => {});
       break;
     case "capture-complete":
-      await pageMessage(session.tabId, { type: "capture-saved", sessionId: session.sessionId, manifest: message.manifest }).catch(() => {});
-      await status(session.tabId, "所有批次已保存并合并，可回放检查。此次未调用 Google 或 GPT。");
+      await pageMessage(session.tabId, { type: "capture-saved", sessionId: session.sessionId, manifest: message.manifest,
+        transcriptionEnabled: session.transcriptionEnabled === true }).catch(() => {});
+      await status(session.tabId, session.transcriptionEnabled
+        ? "所有音频批次已保存并合并，可回放检查。Google 转写在后台处理，进度见下方；未调用 GPT。"
+        : "所有批次已保存并合并，可回放检查。此次未调用 Google 或 GPT。");
       await finish(session, { complete: true });
       break;
     case "capture-expired":
@@ -236,8 +293,45 @@ async function handleMessage(message, sender) {
   return { ok: true };
 }
 
+function safeTranscriptionStatus(value) {
+  const allowed = new Set(["not_started", "scheduled", "running", "processing", "transcribing", "waiting_for_audio",
+    "prepared", "request_budget_reached", "paused", "disabled", "complete", "error", "needs_attention"]);
+  const count = (number) => Number.isSafeInteger(number) && number >= 0 && number <= 1_000_000 ? number : 0;
+  const blocked = Array.isArray(value?.blocked_windows) ? value.blocked_windows : [];
+  return {
+    status: allowed.has(value?.status) ? value.status : "error",
+    windows_done: count(value?.windows_done), windows_total: count(value?.windows_total),
+    sentences: count(value?.sentences),
+    unknown_windows: blocked.filter((item) => item?.status === "unknown").length,
+    failed_windows: blocked.filter((item) => item?.status === "failed").length,
+  };
+}
+
+async function transcriptionStatus(captureId) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const response = await fetch(`${API}/captures/${captureId}/transcription`, { signal: controller.signal, credentials: "omit" });
+    if (!response.ok) throw new Error("Local transcription status unavailable");
+    // The backend response can include private ASR text. Only fixed status and counts leave the worker.
+    return { ok: true, transcription: safeTranscriptionStatus(await response.json()) };
+  } catch (_) {
+    return { ok: false, error: "无法读取本机转写状态，请检查本机任务。" };
+  } finally { clearTimeout(timer); }
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.target !== "worker") return;
+  if (message.type === "capture-transcription-status") {
+    if (sender.id !== chrome.runtime.id || !sender.tab || sender.frameId !== 0 ||
+        !validVideoUrl(sender.url || sender.tab.url) ||
+        !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(message.captureId || "")) {
+      sendResponse({ ok: false, error: "转写状态请求无效。" });
+      return;
+    }
+    transcriptionStatus(message.captureId).then(sendResponse);
+    return true;
+  }
   if (message.type === "capture-replay") {
     if (sender.id !== chrome.runtime.id || !sender.tab || sender.frameId !== 0 || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(message.captureId || "")) return;
     chrome.tabs.create({ url: `${chrome.runtime.getURL("replay.html")}?id=${encodeURIComponent(message.captureId)}` })

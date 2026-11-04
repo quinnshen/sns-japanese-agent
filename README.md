@@ -7,7 +7,7 @@ A Japanese video learning application for YouTube watch pages and Shorts, develo
 | [Five-second capture test](#five-second-capture-test) | Capture five seconds of tab audio and obtain Japanese transcription with word timestamps | `127.0.0.1:8765` |
 | [Japanese learning application](app/README.md) | Current capture stage: select a video range, upload acknowledged audio batches, verify local storage and replay the recording | `127.0.0.1:8766` |
 
-The current development stage is [batch capture](app/CAPTURE_ACCEPTANCE.md), verified with real 90-second and five-minute selections. Google/GPT processing is disabled by default for this stage. The previous whole-file processing code remains available for later integration; the current 30-minute selection limit does not mean long-video reliability has been validated.
+Batch capture is [verified with real 90-second and five-minute selections](app/CAPTURE_ACCEPTANCE.md). The current [Google window transcription stage](app/TRANSCRIPTION.md) reuses those recordings, caches successful requests and supports incremental processing. Cloud processing remains opt-in. The current 30-minute selection limit does not mean long-video reliability has been validated.
 
 ## Project layout
 

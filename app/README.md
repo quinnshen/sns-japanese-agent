@@ -2,7 +2,7 @@
 
 A Chrome extension and local Python service for Japanese video learning. The current development stage collects a selected YouTube audio range in acknowledged batches, saves the recording locally and provides private replay. See the [capture acceptance checklist](CAPTURE_ACCEPTANCE.md).
 
-The existing transcription and precomputed learning-note modules remain in the backend for later integration. They are not invoked by the new capture flow. Real 90-second and five-minute capture acceptance has passed; 30–40 minute validation follows end-to-end integration.
+Real 90-second and five-minute capture acceptance has passed. The [Google window transcription stage](TRANSCRIPTION.md) can now process saved captures or start in the background while recording, when explicitly enabled. Precomputed translation and learning-note integration follows in the next stage; 30–40 minute validation follows end-to-end integration.
 
 ## Current capture workflow
 
@@ -26,6 +26,8 @@ is outside this stage. Raw batches and combined audio remain in `app/data/captur
 The first icon click prepares the tab audio stream so Chrome's short-lived stream permission
 can be consumed immediately. Recording starts only after you confirm the range. Cancel or
 close the panel to release it; the unconfirmed preparation expires after five minutes.
+
+Set `ENABLE_CAPTURE_TRANSCRIPTION=1` in the local backend configuration to enable Google windows as audio arrives. The extension announces this mode and displays transcription progress. The default is 0 for local capture only. Successful windows, request state and sentence JSON are private local artifacts; [transcription setup and recovery](TRANSCRIPTION.md) describes offline preparation, paid execution and explicit unknown-result retries. GPT processing remains separate.
 
 ## Existing processing modules (next integration stages)
 
@@ -73,7 +75,7 @@ No microphone permission is required. The extension captures digital audio from 
 
 ## Existing cloud configuration (not used by capture)
 
-OpenAI processing is **off by default**. The current extension does not submit cloud work even if keys exist locally. The following settings are retained for the existing backend CLI modules and the explicitly enabled legacy route.
+OpenAI processing is **off by default**. The current capture workflow never submits OpenAI work. Google window transcription uses its separate opt-in flag described above. The following OpenAI settings are retained for the existing backend CLI modules and the explicitly enabled legacy route.
 
 From `app/backend/`:
 
@@ -132,7 +134,7 @@ Replace `./video.mov` with the path to your own media. This CLI produces transcr
 
 | Data | Destination and retention |
 |---|---|
-| Current tab audio | Unacknowledged fragments stay in browser memory; confirmed fragments and combined recording remain locally in `data/captures/`; not sent to cloud services |
+| Current tab audio | Unacknowledged fragments stay in browser memory; confirmed fragments and combined recording remain locally in `data/captures/`; audio windows go to Google only when capture transcription is enabled |
 | Uploaded local audio | Deleted when the normal job finishes, including handled success and failure; forced termination may leave files in `data/uploads/` |
 | Converted audio slices | Decoded locally in memory for each transcription request; the application does not save separate WAV slice files |
 | Transcript and context text | Sent to OpenAI only when learning-note generation is enabled or explicitly run via CLI; video frames are not sent |
@@ -152,7 +154,7 @@ cd app
 backend/.venv/bin/python -m unittest discover -s backend -p 'test_*.py' -v
 ```
 
-The tests use mock cloud responses and do not require real credentials or consume cloud quota. `GET http://127.0.0.1:8766/health` reports capture capability and whether the legacy cloud route is enabled, without reading or returning API key values.
+The tests use mock cloud responses and do not require real credentials or consume cloud quota. `GET http://127.0.0.1:8766/health` reports capture capability, whether any server cloud processing is enabled, and the separate capture transcription capability, without returning API key values.
 
 From the repository root, run the extension's offline contract and lifecycle checks with Node.js:
 
