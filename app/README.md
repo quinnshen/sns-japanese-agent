@@ -1,62 +1,32 @@
-# SNS Japanese Agent
+# Setup and usage
 
-A Chrome extension and local Python service for Japanese video learning. Select a YouTube range, save acknowledged audio batches, then optionally transcribe and prepare Chinese translation, Japanese readings and learning notes. See the [capture acceptance checklist](CAPTURE_ACCEPTANCE.md).
+SNS Japanese Agent turns videos you enjoy into Japanese learning material: compare each sentence with its Chinese translation, explore grammar and expressions, save sentences, and revisit clips for review.
 
-Real 90-second and five-minute capture and Google transcription acceptance has passed. The [Google stage](TRANSCRIPTION.md) processes saved captures or starts in the background while recording. The [learning-note stage](LEARNING.md) independently batches available sentences and saves notes for local display; its backend has produced 37/37 validated notes from a saved 90-second transcript. The user has confirmed basic Chrome learning interactions work in version 0.5.2; explanation accuracy still needs review. Both cloud stages require separate opt-in settings; 30–40 minute validation follows end-to-end integration.
+See the [project overview](../README.md) for the product philosophy, core features, and roadmap. The current learning interface, translations, and explanations are in Chinese.
 
-## Learn and review
+## Current support
 
-1. On a YouTube video, click **S** and choose a range. Shorts and videos up to three minutes default to the whole video. For longer videos the start defaults to the current position; choose an end, or select the whole video when it fits the 30-minute limit.
-2. Click **生成学习内容**. The extension connects audio, seeks to the start and plays the selected range at normal speed. Keep playback uninterrupted. Transcription and analysis can start while the audio is being recorded.
-3. Once the recording is saved and a sentence is ready, choose **从片段起点学习**. Listen again, expand the analysis or save a sentence with **收藏**. Remaining analysis can finish in the background. **学习下一段** prefills the previous segment's end; click Generate again after choosing the new end.
-4. To read something already saved, explicitly open **复习 → 最近片段** or **收藏句子**. Recent clips are grouped by video and open the exact range selected. If Chrome requires permission again after navigating to another video, click **S** on that video to open the selected clip.
+- Japanese audio is required; existing video captions are optional. Speakers are not identified separately.
+- The extension currently supports **YouTube watch pages and Shorts**. Tab audio capture is the underlying capability; other Chrome video pages still need adapters for page detection, source links, and playback controls.
+- Each selection can be up to **30 minutes**. This is an input limit; reliability with 30–40-minute videos has not yet been validated.
+- Generation requires **continuous playback at 1× speed**. Pausing, seeking, switching videos, or an ad in the current player interrupts recording. Buffering for more than 4 seconds also interrupts it.
+- OCR and video understanding are not implemented yet. Explanations retain uncertainty where meaning depends on visuals.
 
-During generation, **停止生成** stops the current recording. If the player reports an ad, the extension stops recording and keeps confirmed data. Resume playback in the player, wait for the ad to finish, then choose **重试本段** to start the original range again. This is a new generation, not a continuation of the interrupted recording.
+## A learning session
 
-## Audio capture
+1. Open a video and click the **S** extension icon.
+2. Choose a time range. Shorts and videos up to 3 minutes default to the whole video. Other videos default to the current playback position; enter an end time and click **生成学习内容** (Generate learning content).
+3. Let the selection play normally. Audio is saved locally, and enabled transcription and analysis stages run in the background.
+4. Once recording is saved and some sentences are ready, click **从片段起点学习** (Study from the start) to follow subtitles, replay sentences, and expand explanations.
+5. Click **收藏** (Save) to keep a sentence and its full explanation. **学习下一段** (Study the next clip) prefills the next start time; confirm the range before generating again.
 
-```text
-Click extension on a YouTube watch or Shorts page
-  → Confirm a start/end range and generate learning content
-  → Play the selected range at 1× and continuously record tab audio
-  → Upload numbered fragments with checksums and observed timing
-  → Save each fragment and its manifest, then acknowledge receipt
-  → Release each browser fragment after matching acknowledgement
-  → Flush the final fragment and confirm the complete sequence
-  → Verify and combine the continuous WebM recording
-  → Start studying, or open private audio replay under 调试信息
-```
+**复习** (Review) is a separate entry point. Select a specific range under **最近片段** (Recent clips), grouped by video, or open **收藏句子** (Saved sentences). Reviewing, expanding explanations, and saving sentences do not start new cloud generation.
 
-Uploads are fragments of one recording container; do not decode each fragment independently.
-An interrupted upload retains acknowledged batches locally. Unacknowledged browser data is
-kept in the failed session until the user explicitly releases it; cross-browser-restart recovery
-is outside this stage. Confirmed batches and combined audio are kept under the local retention policy below.
+## Installation
 
-The first icon click opens the panel. The tab audio stream is requested only after you confirm the range.
+Requires Chrome 116+ and Python 3.11+. Both the extension and backend run on your own computer.
 
-Set `ENABLE_CAPTURE_TRANSCRIPTION=1` in the local backend configuration to enable Google windows as audio arrives. The extension announces this mode and displays transcription progress. The default is 0 for local capture only. Successful windows, request state and sentence JSON are private local artifacts; [transcription setup and recovery](TRANSCRIPTION.md) describes offline preparation, paid execution and explicit unknown-result retries. GPT processing remains separate.
-
-## Incremental learning workflow
-
-```text
-Confirmed audio batches on the local backend
-  → Assemble and decode the continuous recording prefix
-  → Prepare Google windows (up to 45 seconds with overlap)
-  → Google Speech-to-Text V2: Japanese text and word timestamps
-  → Merge timestamps and finalize available sentences
-  → Independently group up to 6 sentences with nearby text context
-  → OpenAI: Chinese translation, readings, concise explanations and ASR doubts
-  → Validate each sentence and save accepted notes locally
-  → Display annotated Japanese and Chinese; expand saved analysis on click
-```
-
-The Google audio slices and OpenAI sentence batches are separate stages. Translation and explanations are generated in advance in the same model request. Displaying a saved analysis does not call the model again.
-
-Original ASR text is retained separately from annotated display text. Validation allows only added kana annotations, preserving existing source parentheses. Valid neighbors survive a failed sentence. The new capture pipeline does not automatically resend failed or unknown requests; [explicit retry and request budgets](LEARNING.md#恢复重试与请求限制) are documented separately. Opening saved notes never starts cloud work.
-
-## Setup
-
-Requires Chrome 116+ and Python 3.11+. Current capture and replay need no Google/OpenAI credentials. The [Google ADC setup](../README.md#common-prerequisites) is needed only when explicitly using cloud processing later.
+### Configure the local backend
 
 From the repository root:
 
@@ -64,25 +34,28 @@ From the repository root:
 cd app/backend
 python3.11 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
-cp .env.example .env.local
+cp -n .env.example .env.local
 chmod 600 .env.local
 ```
 
-Run `.venv/bin/python server.py`. The service listens only on `127.0.0.1:8766`. Keep `ENABLE_LEGACY_PIPELINE=0` during capture acceptance. You can skip copying `.env.example` for capture-only use; the cloud defaults are disabled.
+`cp -n` preserves an existing local configuration. Store real credentials only in `.env.local`, which Git ignores.
 
-In Chrome:
+### Configure cloud processing
 
-1. Open `chrome://extensions` and enable Developer mode.
-2. Choose **Load unpacked** and select only `app/extension/`.
-3. Open a Japanese YouTube watch or Shorts page and click the extension icon.
-4. Set start/end time in the panel, then choose **生成学习内容**.
-5. Keep the tab open at normal speed. When the recording is saved, study the ready sentences or choose **调试信息 → 打开私有录音回放** to check the recording.
+Cloud calls are disabled by default; audio capture and playback work locally. To generate the full learning content, configure your own Google Cloud transcription service and OpenAI API key.
 
-No microphone permission is required. The extension captures digital audio from the selected tab.
+**Google transcription**
 
-## Cloud configuration
+Enable billing and the Speech-to-Text API in your own Google Cloud project. Install the [Google Cloud CLI](https://cloud.google.com/sdk/docs/install) and set up [local Application Default Credentials (ADC)](https://docs.cloud.google.com/docs/authentication/set-up-adc-local-dev-environment):
 
-Both cloud stages are **off by default**. Set `ENABLE_CAPTURE_TRANSCRIPTION=1` for Google and `ENABLE_CAPTURE_ENRICHMENT=1` for automatic OpenAI learning notes. The panel announces the enabled mode before recording. For an existing capture, the explicit learning endpoint or CLI can add notes without calling Google again. See [learning setup and recovery](LEARNING.md).
+```sh
+gcloud auth application-default login --scopes=https://www.googleapis.com/auth/cloud-platform
+gcloud auth application-default set-quota-project YOUR_PROJECT_ID
+```
+
+Replace `YOUR_PROJECT_ID` with your own project ID. The signed-in identity must have permission to use that project. ADC stays in the standard local configuration directory outside this repository; do not copy account passwords or credential JSON files into the project.
+
+**Translation and explanations**
 
 From `app/backend/`:
 
@@ -90,91 +63,110 @@ From `app/backend/`:
 .venv/bin/python configure_openai_key.py
 ```
 
-Paste your key at the hidden terminal prompt. The script updates `OPENAI_API_KEY` in `backend/.env.local` with owner-only permissions (`0600`) and preserves other settings. This local file is ignored by Git. Old one-line key files remain readable and are converted to `KEY=VALUE` when the configuration tool saves them.
+Paste your own key at the hidden-input prompt. The tool updates the private `.env.local` while preserving other settings. Do not put real keys in chat, source code, the extension, or command-line arguments.
 
-The previous whole-file `/jobs` route uses separate flags, `ENABLE_LEGACY_PIPELINE=1` and `ENABLE_ENRICHMENT=1`. Keep them disabled for the incremental workflow. Capture endpoints use the new independent stages.
+Then set the following in `app/backend/.env.local`:
+
+```dotenv
+GOOGLE_CLOUD_PROJECT=YOUR_PROJECT_ID
+ENABLE_CAPTURE_TRANSCRIPTION=1
+ENABLE_CAPTURE_ENRICHMENT=1
+ENABLE_LEGACY_PIPELINE=0
+ENABLE_ENRICHMENT=0
+```
+
+`OPENAI_MODEL` selects the model; see `.env.example` for its default. Recording and local playback require no cloud credentials. Transcription and explanation costs belong to the accounts you configure; the repository provides no public service using the author's quota.
+
+### Start the service
+
+From `app/backend/`:
 
 ```sh
 .venv/bin/python server.py
 ```
 
-All application entry points use the same configuration module: explicit process environment → `app/backend/.env.local` → non-secret defaults. An explicit empty environment value also overrides the file. The loader uses this exact path, never searches parent directories, never executes shell expressions and does not expand `${...}`. Keep `.env.local` outside the extension directory.
+The service listens only on `127.0.0.1:8766`. Keep the terminal running while using the application. Start it again after restarting your computer, and restart the service after changing backend code or configuration.
 
-The tracked `.env.example` contains only placeholders and non-secret defaults. Keep Google ADC in the Google Cloud CLI's standard local credentials location, outside the repository. Do not put your Google account password, refresh token or credential JSON into `.env.local`. If you use an external service-account file through `GOOGLE_APPLICATION_CREDENTIALS`, configure that environment variable yourself with a path outside the repository; never commit the file.
+### Load the extension
 
-The current default model is `gpt-6-luna`; set `OPENAI_MODEL` to choose a compatible model available to your own account. If processing fails, the completed transcript and previously saved analysis batches remain available. The UI reports an incomplete analysis rather than discarding the transcript.
+1. Open `chrome://extensions` and enable **Developer mode**.
+2. Click **Load unpacked** and select **`app/extension/`** in this repository.
+3. Open a supported video page and click the **S** extension icon.
 
-Keep keys out of chat messages, extension files, source code and Git. The extension never receives the key. Do not copy `.env.local` when sharing this project.
+Load only the extension directory, not the repository root or any directory containing Python environments, SDKs, or credentials. The extension captures tab audio and does not need microphone permission.
 
-## Saved results and reuse
+After updating extension code, reload the extension in Chrome and refresh the video page.
 
-Current results are saved under `app/data/captures/<capture-id>/`: recording batches, Google windows, ASR JSON, SQLite state and learning notes. They include source URLs and viewing/learning history. The entire directory is private local data ignored by Git. Legacy whole-file jobs remain under `app/data/<job-id>.json`.
+## Generation, retries, and review
 
-The extension creates a new capture ID for each selected range. Recent clips lists each completed range with accepted learning notes separately, even when they come from the same video. Reviewing a saved clip or favorite does not record audio or start cloud processing.
+### First-time preparation
 
-Favorites are stored independently in `app/data/learning_library/favorites.sqlite3`. Each holds the Japanese with readings, Chinese translation, complete analysis, and the source video and time when available. It remains readable after the original capture expires; listening again uses the original video.
+The first generation requires playing the selected clip. Transcription and explanations can start during recording. After recording finishes, you can study available sentences while the remaining explanations continue processing.
 
-To prepare the new learning stage offline, run from `app/backend/`:
+Clicking S only opens the panel. Audio access and the task begin after you confirm **生成学习内容** (Generate learning content). **调试信息** (Debug information) contains upload intervals, batch metrics, and private recording playback for troubleshooting.
 
-```sh
-.venv/bin/python capture_learn_cli.py ../data/captures/YOUR_CAPTURE_ID
-```
+### Interruptions and ads
 
-This command makes no cloud calls. Add `--run-openai --max-new-requests 1` to permit one new paid request with your own key. Successful notes are reused. The older `enrich_cli.py ../data/YOUR_JOB_ID.json` is a separate legacy command and does make OpenAI calls.
+Click **停止生成** (Stop generation) to stop recording. If an ad interrupts recording, resume playback in the player, wait for the ad to finish, then select **重试本段** (Retry this clip).
 
-Local-video transcription is also available from the backend directory:
+Retrying creates a new recording task for the original range and may incur new transcription and explanation costs. The application waits for backend confirmation that the old task has stopped, and will not start the retry if the video has changed. Acknowledged data remains saved, and cloud requests already sent may still finish.
 
-```sh
-.venv/bin/python cli.py ./video.mov
-```
+### Incomplete explanations
 
-Replace `./video.mov` with the path to your own media. This CLI produces transcription JSON; there is no separate local-video playback interface in this milestone. Use `enrich_cli.py` afterward for optional learning notes.
+ASR transcripts may contain recognition errors, omitted speech, or incorrect sentence boundaries. The original ASR is stored separately; displayed Japanese may add kana readings but must not silently rewrite the source sentence.
 
-## Current limits
+You can study neighboring sentences that passed validation. Incomplete or invalid sentences remain pending; failed requests and requests with unknown outcomes are not automatically resent. Use [targeted retries with a request limit](LEARNING.md#恢复重试与请求限制) when repairs are needed (technical guide in Chinese).
 
-- Maximum selected range: 30 minutes, including ranges inside longer source videos. Maximum stored audio: 200 MB; maximum individual upload: 10 MB. These are input guards, not a guarantee of reliable long-video processing.
-- Upload interval is configurable from 1 to 30 seconds, default 5 seconds. Browser memory retains unacknowledged fragments; their queue is bounded at 16 MiB. On failure, capture stops and pending data stays until the user releases it.
-- Playback must stay at 1× without seeking or pausing. Buffering longer than four seconds aborts recording. Shorter interruptions may still affect alignment; long-video synchronization has not been validated.
-- The extension supports one active capture at a time. Confirmed batches and downstream results persist across backend restarts. Backend work can be explicitly resumed; automatic browser-session recovery is not implemented.
-- Sentence boundaries are inferred from ASR punctuation and timing, not manually checked subtitles. Multiple speakers are not identified. Background noise, overlapping speech and colloquial speech may produce errors.
-- No OCR, screenshots, video understanding or speaker recognition is included. Explanations cannot reliably resolve visual references from audio alone.
+### Recent clips and saved sentences
 
-## Data flow and retention
+- **最近片段** (Recent clips) lists the full ranges with generated learning content. Multiple clips from the same video can be selected separately.
+- Opening a clip takes you to its source video. If Chrome needs renewed permission, click S on the source page to continue opening the selected clip.
+- **收藏句子** (Saved sentences) keeps the original sentence with readings, Chinese translation, full explanation, source link, and available timestamps. Saved sentences remain readable after the original clip expires. Replaying the source depends on the original video remaining accessible.
 
-| Data | Destination and retention |
+## Local storage and cleanup
+
+| Data | Retention |
 |---|---|
-| Current tab audio | Unacknowledged fragments stay in browser memory; confirmed fragments and combined recording remain locally in `data/captures/`; audio windows go to Google only when capture transcription is enabled |
-| Uploaded local audio | Deleted when the normal job finishes, including handled success and failure; forced termination may leave files in `data/uploads/` |
-| Converted audio | Capture processing retains a local PCM cache for reuse; Google request windows are cut from it |
-| Transcript and context text | Sent to OpenAI only when learning-note generation is enabled or explicitly run via CLI; video frames are not sent |
-| Completed and interrupted captures | The backend checks at startup and hourly; captures expire seven days after the terminal recording manifest was saved. It skips recording, queued and active processing, as well as jobs whose safety cannot be confirmed. Cleanup includes that capture's recording, transcript and notes |
-| Favorite sentences | Saved independently until removed from favorites |
-| Google credentials / OpenAI key | Stay on the backend computer; not sent to the extension or included in repository files |
+| Recordings, transcripts, explanations, and task state | Stored in `app/data/captures/<capture-id>/`, separately for each selection. |
+| Ordinary clips | Checked at backend startup and hourly while running. Terminal tasks are cleaned up after **7 days**, including their recordings, transcripts, and explanations not saved separately. |
+| Tasks recording, queued, or processing | Skipped during cleanup. Unknown states, abnormal files, and lock conflicts are also retained conservatively. |
+| Saved sentences | Stored independently in `app/data/learning_library/favorites.sqlite3` until removed from saved sentences. |
+| Legacy whole-file tasks and uploads | Not covered by this clip cleanup policy. Manage them manually with the service stopped. |
 
-The seven-day policy applies to existing local captures as well as new ones. It does not clean legacy whole-file jobs or provider-side data. Remote processing and retention follow your provider account settings. After stopping the service, you can remove unneeded legacy result JSON or abandoned uploads to reclaim space.
+The 7 days are measured from the last save time of the terminal recording manifest. Reading a clip does not extend retention, and the policy also applies to existing clips. Save the sentences you want to keep or back up local data before older records expire. Data does not sync automatically between computers.
 
-The local HTTP service is intended for one user's computer. It checks the loopback Host and allows extension origins or local clients without an Origin header before accessing saved data or starting work. This is not authentication against other programs or extensions on the same computer. Do not expose its port publicly or run it as a shared hosted service. Stop it when you have finished using the application.
+The data directory contains source links, recordings, and learning history and is excluded from Git. Files and directories use private permissions. Do not copy real data into public test fixtures or issues.
 
-## Offline verification
+## Privacy and costs
 
-From the repository root, after installing backend dependencies:
+- Google receives audio needed for each recognition window. OpenAI receives transcripts and textual context. Video frames are not sent.
+- Calls use your own project and API key. Cloud processing is disabled by default, and review does not regenerate content.
+- Expanding a saved explanation does not call a model. Successful cloud results are reused; requests with unknown outcomes are not retried blindly.
+- Credentials stay in the local backend. The extension receives neither Google login credentials nor an OpenAI API key.
+- Local retention does not change cloud providers' data retention settings and is not a hard spending cap.
 
-```sh
-cd app
-backend/.venv/bin/python -m unittest discover -s backend -p 'test_*.py' -v
-```
+The service is intended for a personal computer. Loopback Host and Origin checks restrict access but do not authenticate other programs on the same machine. Do not expose the port publicly or use it as a shared hosted service.
 
-The tests use mock cloud responses and do not require real credentials or consume cloud quota. `GET http://127.0.0.1:8766/health` reports capture capability and separate transcription/enrichment settings, without returning API key values.
+## Troubleshooting
 
-From the repository root, run the extension's offline contract and lifecycle checks with Node.js:
+**Saving fails, or review cannot load**
 
-```sh
-node scripts/test_capture_extension.mjs
-node scripts/test_capture_page.mjs
-node scripts/test_capture_worker.mjs
-node scripts/test_review_panel.mjs
-```
+Check that the current backend is running. Updating the extension does not replace a running Python service. The panel prompts you to restart the backend if an older version lacks the required endpoints. `GET http://127.0.0.1:8766/health` returns the service version and capabilities, not keys.
 
-These checks use synthetic media, a simulated DOM and mocked Chrome APIs; real-browser capture acceptance remains separate.
+**Some explanations are missing**
 
-The extension requests `activeTab`, `tabCapture`, `offscreen`, `scripting`, `storage` and access to `http://127.0.0.1:8766/*` for capture, page display, task state and communication with the local service. It contains no public cloud endpoint or account credentials.
+Check whether cloud processing is enabled and whether the panel reports pending sentences. Raw responses and validated sentences remain on disk; see the [learning-note guide](LEARNING.md) for recovery rules (Chinese).
+
+**Video playback fails or stops during generation**
+
+Confirm that the video itself plays and ads have finished, then retry. Pausing and seeking freely during recording are not supported yet. Long-video recovery and reliability remain on the roadmap.
+
+## Development and diagnostics
+
+- [Transcription, time mapping, and recovery](TRANSCRIPTION.md) (Chinese)
+- [Explanation style, validation, caching, and request limits](LEARNING.md) (Chinese)
+- [Capture acceptance](CAPTURE_ACCEPTANCE.md) and [batch protocol](CAPTURE_PROTOCOL.md) (Chinese)
+- [Commit safety and offline tests](../DEVELOPMENT.md)
+- [Historical five-second integration test](../docs/FIVE_SECOND_TEST.md)
+
+Backend and extension tests use temporary data, synthetic audio, and mocked cloud services. They require no real API key and consume no cloud quota.

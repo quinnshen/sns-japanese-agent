@@ -29,6 +29,12 @@ If a real credential is ever published, revoke or rotate it through its provider
 ```sh
 python3 -m unittest discover -s scripts -p 'test_*.py' -v
 app/backend/.venv/bin/python -m unittest discover -s app/backend -p 'test_*.py' -v
+node scripts/test_capture_extension.mjs
+node scripts/test_capture_page.mjs
+node scripts/test_capture_worker.mjs
+node scripts/test_review_panel.mjs
 ```
 
 Tests use temporary Git repositories, temporary config files and synthetic credentials. They do not need your real key, Google login or paid API access.
+
+Setup and user-facing behavior are documented in the [application guide](app/README.md). The separate [five-second integration test](docs/FIVE_SECOND_TEST.md) remains available for troubleshooting tab audio and transcription.
