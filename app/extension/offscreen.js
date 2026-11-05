@@ -100,18 +100,24 @@ async function abort(current, error, notify = false, details = {}) {
       current.controllers.forEach((controller) => controller.abort());
       if (current.recorder?.state !== "inactive" && current.recorder) current.recorder.stop();
       await releaseMedia(current);
+      current.abortConfirmed = !current.created;
       if (current.created) {
         const payload = { failure: current.failure };
         if (current.recordingStoppedAtMs !== undefined) payload.recording_stopped_at_ms = current.recordingStoppedAtMs;
         if (Number.isFinite(details.playbackEndVideoSec) && details.playbackEndVideoSec >= 0) payload.playback_end_video_sec = details.playbackEndVideoSec;
         if (current.playbackEvents?.length) payload.playback_events = current.playbackEvents;
-        try { await jsonRequest(current, `/captures/${current.sessionId}/abort`, payload, false); }
+        try {
+          const receipt = await jsonRequest(current, `/captures/${current.sessionId}/abort`, payload, false);
+          if (receipt?.id !== current.sessionId || receipt.status !== "aborted") throw new Error("中断确认不匹配");
+          current.abortConfirmed = true;
+        }
         catch (_) { error = `${error}；无法确认后端中断状态，请检查本机任务清单`; }
       }
       // Keep every unacknowledged Blob in the failed session until explicit user cancellation.
       progress(current);
       if (notify) await send(current, "capture-error", {
         error, pendingBatches: current.queue?.length || 0, pendingBytes: current.pendingBytes || 0,
+        ...(current.failure.code === "advertisement_started" ? { code: current.failure.code } : {}),
       }).catch(() => {});
     })();
   }
@@ -122,6 +128,7 @@ async function abort(current, error, notify = false, details = {}) {
     current.pendingBytes = 0;
     if (session === current) session = undefined;
   }
+  return current.abortConfirmed === true;
 }
 
 async function arm(message) {
@@ -312,7 +319,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   else if (message.type === "playback-event") action = Promise.resolve().then(() => playbackEvent(message));
   else if (message.type === "capture-finish") { void finish(message); sendResponse({ ok: true }); return; }
   else if (message.type === "capture-fail") action = abort(session, message.error || "采集失败", true, message).then(() => ({ ok: true }));
-  else if (message.type === "capture-abort") action = abort(session, "用户中断采集").then(() => ({ ok: true }));
+  else if (message.type === "capture-abort") action = abort(session, "用户中断采集").then((abortConfirmed) => ({ ok: true, abortConfirmed }));
   else return;
   Promise.resolve(action).then(sendResponse).catch((error) => sendResponse({ ok: false, error: error.message }));
   return true;

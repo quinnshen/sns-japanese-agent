@@ -15,7 +15,7 @@ async function eventually(check) {
   for (let n = 0; n < 150; n++) { if (check()) return; await sleep(20); }
   assert.fail("Expected extension event did not arrive");
 }
-function harness({ uploadStatus = [], badAck = false, holdFirst = false, finalBytes = "end" } = {}) {
+function harness({ uploadStatus = [], badAck = false, holdFirst = false, finalBytes = "end", abortConfirmed = true } = {}) {
   let listener;
   let recorder;
   let attempts = 0;
@@ -80,6 +80,7 @@ function harness({ uploadStatus = [], badAck = false, holdFirst = false, finalBy
         manifest = { ...manifest, ...body, status: "complete", audio_size_bytes: [...stored.values()].reduce((sum, blob) => sum + blob.size, 0) };
         return { ok: true, status: 200, json: async () => ({ ...manifest }) };
       }
+      if (path.endsWith("/abort") && !abortConfirmed) return { ok: false, status: 409, json: async () => ({ error: "synthetic abort failure" }) };
       return { ok: true, status: 200, json: async () => ({ id, status: path.endsWith("/abort") ? "aborted" : "recording" }) };
     },
   });
@@ -100,6 +101,17 @@ async function begin(h) {
 }
 async function finish(h) {
   await h.dispatch("capture-finish", { playbackEndVideoSec: 150.01, playbackEvents: [{ type: "playing", at_ms: Date.now(), video_sec: 30.01 }] });
+}
+
+{
+  for (const abortConfirmed of [true, false]) {
+    const h = harness({ abortConfirmed });
+    await begin(h);
+    const reply = await h.dispatch("capture-abort");
+    assert.equal(reply.ok, true, "Browser media must be released even if local storage fails");
+    assert.equal(reply.abortConfirmed, abortConfirmed);
+  }
+  console.log("PASS browser release and the local backend abort receipt are reported separately");
 }
 
 {
@@ -222,4 +234,4 @@ console.log("PASS stage 1 has no paid processing endpoint and uses safe text ren
   assert.throws(() => validation.validate(0, 100.001, 100));
   console.log("PASS range selection accepts long-source excerpts and rejects invalid boundaries");
 }
-console.log("11 offline extension checks passed.");
+console.log("12 offline extension checks passed.");

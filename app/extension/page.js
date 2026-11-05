@@ -1,5 +1,5 @@
 (() => {
-  const PAGE_VERSION = "0.5.4";
+  const PAGE_VERSION = "0.6.0";
   const PAGE_PROTOCOL = 1;
   const previous = window.__snsJapaneseAgentPage;
   if (previous) {
@@ -59,11 +59,21 @@
   let learningSourceIdentity = "";
   let captureFormAutoCollapsed = false;
   let captureFormUserOpened = false;
+  let view = "setup";
+  let viewBeforeReview = "setup";
+  let submittedRange;
+  let completedRange;
+  let takeComplete = false;
+  let captureFailure = "";
+  let releasingCapture = false;
+  let selectedFromReview = false;
+  let displayCaptureId;
   const openAnalyses = new Set();
 
   const host = document.createElement("div");
   host.id = rootId;
-  const shadow = host.attachShadow({ mode: "open" });
+  // Study history and favorites belong to the extension, not the video page.
+  const shadow = host.attachShadow({ mode: "closed" });
   const style = document.createElement("style");
   style.textContent = `
     :host { all: initial; }
@@ -74,6 +84,13 @@
       border: 1px solid #d8e3da; border-radius: 14px; box-shadow: 0 12px 36px #0005;
       font: 14px/1.55 -apple-system, BlinkMacSystemFont, sans-serif; }
     .head { flex: 0 0 auto; padding: 13px 15px; border-bottom: 1px solid #dbe7df; display: flex; gap: 10px; align-items: start; }
+    .panel [hidden] { display: none !important; }
+    .panel[data-view="setup"], .panel[data-view="working"] { height: auto; }
+    .panel[data-view="setup"] .capture-options[open] { max-height: min(58dvh, 430px); }
+    .panel > .status { flex: 0 0 auto; padding: 9px 14px 5px; font-size: 13px; }
+    .panel > .status:empty { display: none; }
+    .diagnostics { flex: 0 1 auto; max-height: 35%; overflow: auto; border-top: 1px solid #dbe7df; padding: 4px 12px; font-size: 12px; color: #60786a; }
+    .diagnostics summary { cursor: pointer; }
     .title { font-size: 15px; font-weight: 700; flex: 1; }
     .close { cursor: pointer; border: 0; background: transparent; font-size: 18px; color: #647a6d; }
     button:disabled { opacity: .5; cursor: default !important; }
@@ -85,7 +102,7 @@
     .learning-toolbar { flex: 0 0 auto; padding: 7px 12px; display: grid; gap: 5px; border-bottom: 1px solid #dbe7df; }
     .learning-status { max-height: 4.5em; overflow-y: auto; }
     .alignment-note { font-size: 11px; color: #798f80; }
-    .toolbar-actions { display: flex; gap: 6px; align-items: center; justify-content: space-between; }
+    .toolbar-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
     .toolbar-actions button { min-width: 0; padding: 4px 7px !important; font-size: 12px; }
     .list { flex: 1 1 0; min-height: 0; overflow-y: auto; padding: 0 8px 8px; }
     @media (max-height: 420px) { .head { padding: 8px 12px; } .learning-status { max-height: 2.5em; } .capture-options[open] { max-height: 35%; } }
@@ -131,6 +148,7 @@
   close.title = "关闭面板";
   close.addEventListener("click", () => {
     panelDismissed = true;
+    reviewPanel.close();
     if (reconnecting) {
       dismissedReconnects.add(reconnectRequestId);
       if (dismissedReconnects.size > 8) dismissedReconnects.delete(dismissedReconnects.values().next().value);
@@ -154,14 +172,13 @@
   captureForm.open = true;
   const captureSummary = document.createElement("summary");
   captureSummary.className = "capture-summary";
-  captureSummary.textContent = "采集设置与回放";
+  captureSummary.textContent = "选择学习范围";
   const rememberFormOpen = () => { if (!captureForm.open) captureFormUserOpened = true; };
   captureSummary.addEventListener("click", rememberFormOpen);
   captureSummary.addEventListener("keydown", (event) => { if (["Enter", " "].includes(event.key)) rememberFormOpen(); });
   const controls = document.createElement("div");
   controls.style.cssText = "padding:0 15px 12px;display:grid;gap:8px";
-  controls.append(status);
-  function field(labelText, value) {
+  function field(labelText, value, target = controls) {
     const label = document.createElement("label");
     label.textContent = labelText;
     label.style.cssText = "display:grid;gap:3px";
@@ -170,12 +187,17 @@
     input.value = value;
     input.style.cssText = "padding:6px;border:1px solid #bdcec1;border-radius:5px;font:inherit;color:#21382d;background:white";
     label.append(input);
-    controls.append(label);
+    target.append(label);
     return input;
   }
   const startInput = field("起点（秒、分:秒或时:分:秒）", "0:00");
-  const endInput = field("终点（默认视频结尾）", "");
-  const intervalInput = field("上传间隔（1–30 秒）", "5");
+  const endInput = field("终点（分:秒或时:分:秒）", "");
+  const diagnostics = document.createElement("details");
+  diagnostics.className = "diagnostics";
+  const diagnosticSummary = document.createElement("summary");
+  diagnosticSummary.textContent = "调试信息";
+  diagnostics.append(diagnosticSummary);
+  const intervalInput = field("上传间隔（1–30 秒）", "5", diagnostics);
   intervalInput.inputMode = "decimal";
   for (const input of [startInput, endInput, intervalInput]) {
     input.addEventListener("input", () => { formSourceIdentity = identity(); });
@@ -184,14 +206,34 @@
   buttons.style.cssText = "display:flex;gap:8px";
   const begin = document.createElement("button");
   begin.type = "button";
-  begin.textContent = "开始采集";
+  begin.textContent = "生成学习内容";
   begin.disabled = true;
   const cancel = document.createElement("button");
   cancel.type = "button";
-  cancel.textContent = "中断／释放音频";
+  cancel.textContent = "停止生成";
   cancel.disabled = true;
   for (const button of [begin, cancel]) button.style.cssText = "padding:6px 10px;border:1px solid #bdcec1;border-radius:6px;background:white;color:#355944;cursor:pointer;font:inherit";
-  buttons.append(begin);
+  begin.style.cssText += ";background:#226647;color:#fff;border-color:#226647";
+  function actionButton(text, name) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = name;
+    button.textContent = text;
+    button.style.cssText = cancel.style.cssText;
+    return button;
+  }
+  const entire = actionButton("整段视频", "entire-video");
+  entire.addEventListener("click", () => {
+    const duration = findVideo()?.duration;
+    if (!Number.isFinite(duration) || duration > 1800 || duration < 1) {
+      showStatus("请等待视频加载；超过 30 分钟的视频请选择一个片段。", true);
+      return;
+    }
+    startInput.value = "0:00";
+    endInput.value = String(duration);
+    formSourceIdentity = identity();
+  });
+  buttons.append(begin, entire);
   controls.append(buttons);
   const connectionHint = document.createElement("div");
   connectionHint.className = "connection-hint";
@@ -211,13 +253,31 @@
   learningStatus.className = "learning-status";
   learningStatus.style.cssText = "font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere";
   learningStatus.hidden = true;
-  const loadLearning = document.createElement("button");
-  loadLearning.type = "button";
-  loadLearning.textContent = "读取已保存学习内容";
-  loadLearning.style.cssText = cancel.style.cssText;
-  loadLearning.title = "仅查询本机，不会开始录音或发起云端处理";
-  loadLearning.addEventListener("click", () => { if (extensionContextIsValid()) startLearningPolling(); });
-  controls.append(metrics, transcriptionStatus, replay);
+  const review = actionButton("复习", "open-review");
+  const study = actionButton("从片段起点学习", "start-study");
+  const next = actionButton("学习下一段", "next-segment");
+  const other = actionButton("选择其他片段", "other-segment");
+  const retry = actionButton("重试本段", "retry-segment");
+  const reviewPanel = window.__snsJapaneseReview.create({
+    send: sendToWorker,
+    onOpenClip: (captureId) => sendToWorker({ target: "worker", type: "review-open", captureId }),
+  });
+  head.append(review);
+  review.addEventListener("click", (event) => {
+    if (event.isTrusted === false) return;
+    if (view === "review") {
+      reviewPanel.close();
+      setView(viewBeforeReview);
+      if (view === "study") activateStudyVideo();
+      return;
+    }
+    if (busy || recording || reconnecting || recoveryPending || releasingCapture || !extensionContextIsValid()) return;
+    viewBeforeReview = view;
+    suspendLearningDisplay();
+    setView("review");
+    void reviewPanel.open();
+  });
+  diagnostics.append(metrics, replay);
   captureForm.append(captureSummary, controls);
   const learningToolbar = document.createElement("div");
   learningToolbar.className = "learning-toolbar";
@@ -227,48 +287,51 @@
   alignmentNote.hidden = true;
   const toolbarActions = document.createElement("div");
   toolbarActions.className = "toolbar-actions";
-  toolbarActions.append(loadLearning, cancel);
-  learningToolbar.append(learningStatus, alignmentNote, toolbarActions);
-  panel.append(head, captureForm, learningToolbar, list);
-  begin.addEventListener("click", () => {
-    if (audioReleased && !recoveryPending) { void reconnectAudio(); return; }
-    if (busy || !configured || !extensionContextIsValid()) return;
+  toolbarActions.append(study, next, other, retry, cancel);
+  learningToolbar.append(transcriptionStatus, learningStatus, alignmentNote, toolbarActions);
+  panel.append(head, status, captureForm, learningToolbar, list, reviewPanel.element, diagnostics);
+  begin.addEventListener("click", (event) => { if (event.isTrusted !== false) void generate(); });
+  cancel.addEventListener("click", (event) => { if (event.isTrusted !== false) void releaseCapture(); });
+  retry.addEventListener("click", (event) => { if (event.isTrusted !== false) void retryRange(); });
+  study.addEventListener("click", () => {
+    if (!takeComplete || !sentences.length || !completedRange || recording || recoveryPending || busy) return;
+    if (!activateStudyVideo() || playerShowsAd(video)) {
+      showStatus("请等视频加载、广告结束后再开始学习。", true);
+      return;
+    }
+    setView("study");
+    showStatus("");
     try {
-      const rangeStart = parseTime(startInput.value);
-      const rangeEnd = endInput.value.trim() ? parseTime(endInput.value) : video?.duration;
-      const batchIntervalMs = Number(intervalInput.value) * 1000;
-      if (!Number.isInteger(batchIntervalMs) || batchIntervalMs < 1000 || batchIntervalMs > 30000) throw new Error("上传间隔应为 1–30 秒。");
-      validateRange(rangeStart, rangeEnd, video?.duration);
-      busy = true;
-      updateBeginAvailability();
-      setInputsDisabled(true);
-      showStatus("正在跳转到所选起点，准备采集…");
-      void sendToWorker({ target: "worker", type: "capture-begin", sessionId, rangeStart, rangeEnd, batchIntervalMs })
-        .then((reply) => { if (!reply?.ok) throw new Error(reply?.error || "启动失败"); })
-        .catch((error) => {
-          if (contextInvalidated) return;
-          busy = false;
-          configured = false;
-          updateBeginAvailability();
-          cancel.disabled = false;
-          setInputsDisabled(false);
-          showStatus(`启动失败：${error.message}。请先点“中断／释放音频”，再点击扩展图标重试。`, true);
-        });
-    } catch (error) { showStatus(error.message, true); }
+      video.currentTime = completedRange.start;
+      void Promise.resolve(video.play()).catch(() => showStatus("片段起点已定位，请点击视频播放。"));
+    } catch (_) { showStatus("无法跳转到片段起点，请确认视频已加载。", true); }
+    activeId = "";
+    updateSubtitle();
+    void reviewPanel.refreshFavorites();
   });
-  cancel.addEventListener("click", () => {
-    reconnectEpoch++;
-    stopTranscriptionPolling();
-    stopLearningPolling();
-    suspendLearningDisplay();
-    cancelPreparation();
-    cancel.disabled = true;
-    report("capture-cancel");
+  next.addEventListener("click", () => {
+    if (!canLearnNext()) return;
+    const start = completedRange.end;
+    resetLearningView();
+    startInput.value = String(start);
+    endInput.value = "";
+    formSourceIdentity = identity();
+    setView("setup");
+    showStatus("已把上一段的终点设为起点。请选择下一段的终点。");
+  });
+  other.addEventListener("click", () => {
+    if (!takeComplete || busy || recording || recoveryPending || !audioReleased) return;
+    resetLearningView();
+    formSourceIdentity = undefined;
+    fillRangeDefaults();
+    setView("setup");
+    showStatus("");
   });
   const subtitle = document.createElement("div");
   subtitle.className = "subtitle";
   shadow.append(panel, subtitle);
   document.documentElement.append(host);
+  setView("setup");
 
   function pageInfo() {
     return { ok: true, version: PAGE_VERSION, protocol: PAGE_PROTOCOL };
@@ -282,31 +345,63 @@
     if (error) captureForm.open = true;
   }
 
+  function setView(value) {
+    if (value === "setup" && view !== value) captureForm.open = true;
+    view = value;
+    panel.dataset.view = value;
+    captureForm.hidden = value !== "setup";
+    list.hidden = value !== "study";
+    diagnostics.hidden = value === "review";
+    review.textContent = value === "review" ? "返回学习" : "复习";
+    if (value !== "study") suspendLearningDisplay();
+    updateBeginAvailability();
+    updateSeekAvailability();
+  }
+
+  function canLearnNext() {
+    const duration = findVideo()?.duration;
+    return takeComplete && completedRange && identity() === sourceIdentity && Number.isFinite(duration)
+      && completedRange.end <= duration - 1 && !busy && !recording && !recoveryPending;
+  }
+
+  function updateStudyActions() {
+    study.hidden = !(takeComplete && completedRange && sentences.length && !busy && !recording && !recoveryPending);
+    next.hidden = !(canLearnNext() && (view === "study" || !enrichmentEnabled));
+    other.hidden = !takeComplete || !audioReleased || busy || recording || recoveryPending || !next.hidden;
+    retry.hidden = !(captureFailure && submittedRange);
+    retry.disabled = releasingCapture || reconnecting;
+    cancel.hidden = cancel.disabled || takeComplete;
+    review.disabled = view !== "review" && (contextInvalidated || busy || recording || reconnecting || recoveryPending || releasingCapture);
+    learningToolbar.hidden = view === "review" || (view === "setup" && !recoveryPending && !captureFailure && cancel.hidden);
+  }
+
   function updateBeginAvailability() {
-    const canReconnect = audioReleased && !recoveryPending && !busy && !recording;
-    begin.textContent = reconnecting ? "正在连接音频…" : canReconnect ? "重新连接音频" : "开始采集";
-    begin.disabled = contextInvalidated || reconnecting || recoveryPending || busy || recording || (!configured && !canReconnect);
-    connectionHint.textContent = reconnecting ? "正在连接音频，尚未开始录音。" : canReconnect
-      ? "音频已释放。请先重新连接音频，连接成功后再开始采集。" : recoveryPending
-      ? "请先点击「中断／释放音频」，再连接新的采集任务。" : "";
+    const duration = findVideo()?.duration;
+    begin.textContent = reconnecting ? "正在连接音频…" : "生成学习内容";
+    begin.disabled = contextInvalidated || reconnecting || recoveryPending || releasingCapture || busy || recording || (!configured && !audioReleased);
+    entire.disabled = begin.disabled || (Number.isFinite(duration) && (duration < 1 || duration > 1800));
+    connectionHint.textContent = "生成时请保持连续播放；可用内容会自动保存。";
     connectionHint.hidden = !connectionHint.textContent;
+    updateStudyActions();
   }
 
   async function reconnectAudio() {
-    if (reconnecting || busy || recording || recoveryPending || !audioReleased || !extensionContextIsValid()) return;
+    if (reconnecting || busy || recording || recoveryPending || !audioReleased || !extensionContextIsValid()) return false;
     const epoch = ++reconnectEpoch;
     reconnectRequestId = epoch;
     reconnecting = true;
     updateBeginAvailability();
     setInputsDisabled(true);
-    showStatus("正在重新连接音频；时间范围会保留，连接后请点击开始采集。");
+    showStatus("正在准备所选片段…");
     try {
       const reply = await sendToWorker({ target: "worker", type: "capture-rearm", requestId: epoch });
-      if (contextInvalidated || epoch !== reconnectEpoch) return;
+      if (contextInvalidated || epoch !== reconnectEpoch || panelDismissed) return false;
       if (!reply?.ok) throw new Error(reply?.error || "音频未重新连接，请点击浏览器工具栏 S 重新连接音频。");
       if (!configured || sessionId !== reply.sessionId) throw new Error("音频尚未就绪，请点击浏览器工具栏 S 重新连接音频。");
+      return true;
     } catch (error) {
       if (!contextInvalidated && epoch === reconnectEpoch) showStatus(error.message, true);
+      return false;
     } finally {
       reconnecting = false;
       if (!contextInvalidated) {
@@ -314,6 +409,108 @@
         if (audioReleased && !recoveryPending) setInputsDisabled(false);
       }
     }
+  }
+
+  function fillRangeDefaults() {
+    video = findVideo();
+    if (formSourceIdentity === identity() || !Number.isFinite(video?.duration) || video.duration <= 0 || playerShowsAd(video)) return;
+    const short = new URL(location.href).pathname.startsWith("/shorts/") || video.duration <= 180;
+    startInput.value = short ? "0:00" : String(Math.floor(Math.max(0, Math.min(video.currentTime, video.duration - 1))));
+    endInput.value = short ? String(video.duration) : "";
+    intervalInput.value = "5";
+    formSourceIdentity = identity();
+  }
+
+  async function generate(preset) {
+    if (busy || recording || reconnecting || recoveryPending || releasingCapture || (!configured && !audioReleased)
+        || panelDismissed || !extensionContextIsValid()) return;
+    fillRangeDefaults();
+    const requestedVideo = identity();
+    let selection;
+    try {
+      if (playerShowsAd(video)) throw new Error("请等广告结束，再生成这段学习内容。");
+      const start = preset?.rangeStart ?? parseTime(startInput.value);
+      if (!preset && !endInput.value.trim() && video?.duration > 180) throw new Error("请填写这段的终点，或选择「整段视频」。");
+      const end = preset?.rangeEnd ?? (endInput.value.trim() ? parseTime(endInput.value) : video?.duration);
+      const batchIntervalMs = preset?.batchIntervalMs ?? Number(intervalInput.value) * 1000;
+      if (!Number.isInteger(batchIntervalMs) || batchIntervalMs < 1000 || batchIntervalMs > 30000) throw new Error("上传间隔应为 1–30 秒。");
+      validateRange(start, end, video?.duration);
+      selection = { rangeStart: start, rangeEnd: end, batchIntervalMs };
+    } catch (error) { showStatus(error.message, true); return; }
+
+    resetLearningView();
+    submittedRange = selection;
+    setView("working");
+    if (!configured && !await reconnectAudio()) {
+      if (!panelDismissed && !contextInvalidated && !recoveryPending) setView("setup");
+      return;
+    }
+    if (panelDismissed || contextInvalidated || !configured || submittedRange !== selection) return;
+    if (requestedVideo !== identity()) {
+      await releaseCapture();
+      if (!panelDismissed) showStatus("视频已切换，请重新选择学习范围。", true);
+      return;
+    }
+    const owner = sessionId;
+    busy = true;
+    setInputsDisabled(true);
+    updateBeginAvailability();
+    showStatus("正在跳转到片段起点，准备录音…");
+    try {
+      const reply = await sendToWorker({ target: "worker", type: "capture-begin", sessionId: owner, ...selection });
+      if (!reply?.ok) throw Object.assign(new Error(reply?.error || "无法开始生成。"), { code: reply?.code });
+    } catch (error) {
+      if (contextInvalidated || panelDismissed || sessionId !== owner || audioReleased || releasingCapture) return;
+      busy = false;
+      configured = false;
+      cancel.disabled = false;
+      captureFailure = error.code === "advertisement_started" || captureFailure === "advertisement_started"
+        ? "advertisement_started" : "interrupted";
+      showStatus(captureFailure === "advertisement_started"
+        ? "广告中断了本段。请在播放器继续播放，广告结束后点击「重试本段」。" : `无法生成本段：${error.message}`, true);
+      updateBeginAvailability();
+      setInputsDisabled(false);
+    }
+  }
+
+  async function releaseCapture(requireConfirmed = false) {
+    if (releasingCapture || !sessionId || !extensionContextIsValid()) return false;
+    releasingCapture = true;
+    reconnectEpoch++;
+    stopTranscriptionPolling();
+    stopLearningPolling();
+    suspendLearningDisplay();
+    cancelPreparation();
+    cancel.disabled = true;
+    updateStudyActions();
+    try {
+      const reply = await sendToWorker({ target: "worker", type: "capture-cancel", sessionId });
+      if (!reply?.ok) throw new Error(reply?.error || "未能停止本次生成，请重新打开扩展查看状态。");
+      if (requireConfirmed && reply.abortConfirmed !== true) {
+        if (!contextInvalidated && !panelDismissed) showStatus("本机服务未确认上次任务已停止。请检查服务后再生成。", true);
+        return false;
+      }
+      return true;
+    } catch (error) {
+      if (!contextInvalidated && !panelDismissed && !audioReleased) {
+        cancel.disabled = false;
+        showStatus(error.message, true);
+      }
+      return false;
+    } finally {
+      releasingCapture = false;
+      if (!contextInvalidated) updateBeginAvailability();
+    }
+  }
+
+  async function retryRange() {
+    const selection = submittedRange;
+    if (!captureFailure || !selection || releasingCapture || reconnecting || panelDismissed) return;
+    const ownerVideo = sourceIdentity;
+    if (ownerVideo !== identity()) { showStatus("视频已切换，请先停止旧任务，再选择新片段。", true); return; }
+    if (playerShowsAd(findVideo())) { showStatus("广告仍在播放，请等它结束后重试。", true); return; }
+    if (!audioReleased && !await releaseCapture(true)) return;
+    if (!contextInvalidated && !panelDismissed && ownerVideo === identity()) await generate(selection);
   }
 
   function invalidateContext() {
@@ -335,7 +532,9 @@
     transcriptionStatus.hidden = true;
     learningStatus.hidden = true;
     alignmentNote.hidden = true;
-    loadLearning.disabled = true;
+    review.disabled = true;
+    reviewPanel.close();
+    setView("setup");
     replay.replaceChildren();
     list.replaceChildren();
     subtitle.textContent = "";
@@ -452,13 +651,80 @@
     if (!busy && !recording) { captureForm.open = true; captureFormAutoCollapsed = false; }
   }
 
+  function resetLearningView() {
+    stopTranscriptionPolling();
+    stopLearningPolling();
+    clearLearningDisplay();
+    completedRange = undefined;
+    takeComplete = false;
+    captureFailure = "";
+    selectedFromReview = false;
+    submittedRange = undefined;
+    displayCaptureId = undefined;
+    replay.replaceChildren();
+    metrics.textContent = "";
+    transcriptionStatus.hidden = true;
+    learningStatus.hidden = true;
+  }
+
+  function openIdle() {
+    const wasDismissed = panelDismissed;
+    panelDismissed = false;
+    host.style.display = "";
+    if (!wasDismissed && sourceIdentity === identity() && (takeComplete || view === "review")) return;
+    cancelPreparation();
+    suspendLearningDisplay();
+    reviewPanel.close();
+    resetLearningView();
+    configured = busy = recording = recoveryPending = false;
+    cancel.disabled = true;
+    sessionId = undefined;
+    audioReleased = true;
+    sourceIdentity = identity();
+    fillRangeDefaults();
+    setInputsDisabled(false);
+    setView("setup");
+    showStatus("");
+  }
+
+  function readRange(clip) {
+    const start = clip?.range_start_sec;
+    const end = clip?.range_end_sec;
+    return Number.isFinite(start) && start >= 0 && Number.isFinite(end) && end > start ? { start, end } : undefined;
+  }
+
+  function activateStudyVideo() {
+    const currentVideo = findVideo();
+    if (!currentVideo || sourceIdentity !== identity()) return false;
+    if (currentVideo !== video) suspendLearningDisplay();
+    video = currentVideo;
+    video.addEventListener("timeupdate", updateSubtitle);
+    return true;
+  }
+
+  function openSavedClip(captureId) {
+    if (typeof captureId !== "string" || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(captureId)
+      || busy || recording || recoveryPending || reconnecting || releasingCapture) return { ok: false };
+    panelDismissed = false;
+    reviewPanel.close();
+    resetLearningView();
+    sourceIdentity = identity();
+    activateStudyVideo();
+    audioReleased = !configured;
+    takeComplete = true;
+    selectedFromReview = true;
+    setView("study");
+    showStatus("");
+    startLearningPolling(captureId);
+    return { ok: true };
+  }
+
   function startLearningPolling(captureId) {
-    if (contextInvalidated) return;
-    if (captureId && captureId === learningCaptureId) return;
-    const previousCaptureId = learningCaptureId;
-    if (captureId && captureId !== learningCaptureId) clearLearningDisplay();
+    if (contextInvalidated || !captureId || captureId === learningCaptureId || (sourceIdentity && sourceIdentity !== identity())) return;
+    if (captureId !== displayCaptureId) clearLearningDisplay();
     stopLearningPolling();
     learningCaptureId = captureId;
+    displayCaptureId = captureId;
     learningSourceIdentity = identity();
     const expectedSource = learningSourceIdentity;
     const epoch = learningEpoch;
@@ -466,25 +732,22 @@
     let attentionSnapshot = "";
     let attentionObservations = 0;
     learningStatus.hidden = false;
-    learningStatus.textContent = captureId ? "翻译和解析：等待完整句子就绪…" : "正在读取本机已保存的学习内容…";
+    learningStatus.textContent = selectedFromReview ? "正在读取本机已保存的片段…" : "翻译和解析：等待完整句子就绪…";
     const current = () => !contextInvalidated && learningEpoch === epoch && identity() === expectedSource;
     const schedule = () => { if (current()) learningTimer = setTimeout(() => { void poll(); }, 2500); };
     const poll = async () => {
       if (!current()) return;
       if (learningInFlight) { schedule(); return; }
       learningInFlight = true;
-      loadLearning.disabled = true;
       let terminal = false;
       try {
-        const reply = await sendToWorker({ target: "worker", type: learningCaptureId ? "capture-learning-status" : "capture-learning-load",
-          ...(learningCaptureId ? { captureId: learningCaptureId } : {}) });
+        const reply = await sendToWorker({ target: "worker", type: "capture-learning-status", captureId });
         if (!current()) return;
         if (!reply?.ok || !reply.learning) throw new Error("Learning unavailable");
         const value = reply.learning;
-        if (value.capture_id) {
-          if (!captureId && previousCaptureId && value.capture_id !== previousCaptureId) clearLearningDisplay();
-          learningCaptureId = value.capture_id;
-        }
+        if (value.capture_id && value.capture_id !== captureId) throw new Error("Unexpected capture");
+        if (value.clip?.source_url && identity(value.clip.source_url) !== expectedSource) throw new Error("Unexpected video");
+        if (takeComplete && !completedRange) completedRange = readRange(value.clip);
         const count = (item) => Number.isSafeInteger(item) && item >= 0 ? item : 0;
         const done = count(value.sentences_done), total = count(value.sentences_total);
         if (value.status !== "needs_attention") { attentionSnapshot = ""; attentionObservations = 0; }
@@ -496,15 +759,15 @@
         }
         if (value.status === "not_found") {
           clearLearningDisplay();
-          learningStatus.textContent = "本机还没有这个视频的学习内容。查询未开始录音，也未调用云端。";
+          learningStatus.textContent = "这个片段的学习内容已不存在。";
           terminal = true;
         } else if (value.status === "complete") {
-          learningStatus.textContent = `翻译和解析完成：${done}/${total} 句。点击解析展示已保存内容。`;
+          learningStatus.textContent = `${done} 句可学习。`;
           terminal = true;
         } else if (value.status === "needs_attention") {
-          learningStatus.textContent = `翻译和解析需检查：已完成 ${done}/${total} 句；已有内容可继续学习。不会自动重试未知或失败请求。`;
+          learningStatus.textContent = `${done} 句可学习，${Math.max(0, total - done)} 句待处理。`;
           terminal = true;
-          if (enrichmentEnabled && count(value.batches_done) + count(value.blocked_batches) < count(value.batches_total)) {
+          if ((enrichmentEnabled || selectedFromReview) && count(value.batches_done) + count(value.blocked_batches) < count(value.batches_total)) {
             const snapshot = JSON.stringify([value.revision, done, total, count(value.batches_done), count(value.batches_total), count(value.blocked_batches)]);
             attentionObservations = snapshot === attentionSnapshot ? attentionObservations + 1 : 1;
             attentionSnapshot = snapshot;
@@ -515,14 +778,14 @@
           learningStatus.textContent = `翻译和解析需检查：已完成 ${done}/${total} 句；已有内容可继续学习。不会自动重试未知或失败请求。`;
           terminal = true;
         } else {
-          learningStatus.textContent = `翻译和解析：已完成 ${done}/${total} 句，${count(value.batches_done)}/${count(value.batches_total)} 批；已有内容可直接展开。`;
+          learningStatus.textContent = `正在生成解析：${done} 句可学习${total ? `，共 ${total} 句` : ""}。`;
         }
         if (!enrichmentEnabled && !terminal) {
           if (value.status === "not_started") {
             learningStatus.textContent = "本机尚未预生成翻译和解析；自动处理未启用。读取已有内容不会发起云端处理。";
             terminal = true;
           } else if (++disabledPolls >= 12) {
-            learningStatus.textContent += " 自动处理已关闭，已停止查询；稍后可点击读取已保存学习内容。";
+            learningStatus.textContent += " 稍后可在复习中重新打开此片段。";
             terminal = true;
           }
         }
@@ -533,7 +796,7 @@
       } finally {
         learningInFlight = false;
         if (current()) {
-          loadLearning.disabled = false;
+          updateStudyActions();
           if (!terminal) schedule();
         }
       }
@@ -572,8 +835,8 @@
     return false;
   }
 
-  function identity() {
-    const url = new URL(location.href);
+  function identity(source = location.href) {
+    const url = new URL(source);
     return url.pathname === "/watch" ? url.searchParams.get("v") : url.pathname.split("/")[2];
   }
 
@@ -604,6 +867,7 @@
   }
 
   function configuring(message) {
+    if (message.sourceUrl && identity(message.sourceUrl) !== identity()) return { ok: false, error: "视频已切换，请重新选择学习范围。" };
     panelDismissed = false;
     if (message.sessionId !== sessionId) {
       captureFormAutoCollapsed = false;
@@ -628,12 +892,12 @@
     configured = false;
     busy = false;
     recording = false;
-    updateBeginAvailability();
     cancel.disabled = false;
     setInputsDisabled(true);
     metrics.textContent = "";
     replay.replaceChildren();
     host.style.display = "";
+    updateBeginAvailability();
     return { ok: true };
   }
 
@@ -647,6 +911,7 @@
       // A healthy controller keeps its playback listeners and active recording.
       cancel.disabled = false;
       host.style.display = "";
+      updateStudyActions();
       return { ok: true };
     }
     cancelPreparation();
@@ -657,12 +922,24 @@
     configured = false;
     busy = false;
     recording = false;
-    updateBeginAvailability();
     cancel.disabled = false;
     setInputsDisabled(true);
-    captureForm.open = true;
+    const start = message.rangeStart;
+    const end = message.rangeEnd;
+    if (message.recoveryState === "failed" && Number.isFinite(start) && start >= 0 && Number.isFinite(end) && end > start) {
+      sourceIdentity = identity();
+      submittedRange = { rangeStart: start, rangeEnd: end, batchIntervalMs: 5000 };
+      captureFailure = message.code === "advertisement_started" ? "advertisement_started" : "interrupted";
+      startInput.value = String(start);
+      endInput.value = String(end);
+      formSourceIdentity = identity();
+    } else {
+      submittedRange = undefined;
+      captureFailure = "";
+    }
     host.style.display = "";
-    updateSeekAvailability();
+    reviewPanel.close();
+    setView("working");
     return { ok: true };
   }
 
@@ -709,22 +986,16 @@
     configured = true;
     busy = false;
     recording = false;
-    if (formSourceIdentity !== identity()) {
-      startInput.value = "0:00";
-      endInput.value = String(video.duration);
-      intervalInput.value = "5";
-      formSourceIdentity = identity();
-    }
-    updateBeginAvailability();
+    fillRangeDefaults();
     cancel.disabled = false;
     setInputsDisabled(false);
+    updateBeginAvailability();
     metrics.textContent = "";
     replay.replaceChildren();
     sentences = [];
     list.replaceChildren();
     subtitle.textContent = "";
     host.style.display = panelDismissed ? "none" : "";
-    startLearningPolling();
     return { ok: true };
   }
 
@@ -744,12 +1015,13 @@
     if (recoveryPending) throw new Error("请先释放上次采集会话。");
     if (recording || message.sessionId !== sessionId) throw new Error("录制会话无效。");
     if (identity() !== sourceIdentity || findVideo() !== video) throw new Error("当前视频已切换，请重新点击扩展图标。");
-    if (playerShowsAd(video)) throw new Error("请等待当前播放器的广告结束后再开始采集。");
+    if (playerShowsAd(video)) throw Object.assign(new Error("请等待广告结束后再生成学习内容。"), { code: "advertisement_started" });
     validateRange(message.rangeStart, message.rangeEnd, video.duration);
     cancelPreparation();
     const version = preparationVersion;
     rangeStart = message.rangeStart;
     rangeEnd = message.rangeEnd;
+    submittedRange ??= { rangeStart, rangeEnd, batchIntervalMs: message.batchIntervalMs };
     video.pause();
     video.playbackRate = 1;
     originalLoop = video.loop;
@@ -793,6 +1065,7 @@
       video_replaced: videoWasReplaced(currentVideo, currentPlayer),
     });
     recording = true;
+    setView("working");
     startTranscriptionPolling(sessionId);
     if (enrichmentEnabled) startLearningPolling(sessionId);
     updateSeekAvailability();
@@ -938,6 +1211,11 @@
   }
 
   function showProgress(value) {
+    if (recording && !captureFailure && submittedRange && Number.isFinite(value.elapsed_sec)) {
+      const length = submittedRange.rangeEnd - submittedRange.rangeStart;
+      const elapsed = Math.max(0, Math.min(length, value.elapsed_sec));
+      showStatus(`正在生成学习内容 · 已播放 ${formatTime(elapsed)} / ${formatTime(length)}。请保持连续播放。`);
+    }
     const kib = (bytes) => `${(bytes / 1024).toFixed(1)} KB`;
     metrics.textContent = `任务 ${value.id}\n已产生 ${value.produced} 批 · 已确认 ${value.acknowledged} 批\n待确认 ${kib(value.pending_bytes)} · 峰值 ${kib(value.peak_pending_bytes)}\n已采集 ${formatPreciseTime(value.elapsed_sec)} · 累计 ${kib(value.total_bytes)}` +
       (value.waiting_events ? `\n记录到 ${value.waiting_events} 次缓冲等待，后续对齐须参考播放观测。` : "");
@@ -958,7 +1236,7 @@
         .catch((error) => showStatus(error.message, true));
     });
     const note = document.createElement("div");
-    note.textContent = "可反复回放。要采集另一段，请重新点击扩展图标。";
+    note.textContent = "这份录音可用于本机回放。";
     replay.append(label, open, note);
   }
 
@@ -1000,14 +1278,15 @@
 
   function updateSeekAvailability() {
     for (const row of rows) {
-      row.button.disabled = recording || recoveryPending || !mappedSentence(row.sentence);
-      row.button.title = !mappedSentence(row.sentence) ? "时间待确认，无法跳转" : recoveryPending ? "请先释放上次采集会话；解析仍可展开" : recording ? "采集期间不能跳转；解析仍可展开" : "跳转播放这一句";
+      row.button.disabled = view !== "study" || busy || recording || recoveryPending || !mappedSentence(row.sentence);
+      row.button.title = !mappedSentence(row.sentence) ? "时间待确认，无法跳转" : row.button.disabled ? "生成期间不能跳转" : "跳转播放这一句";
     }
   }
 
   function updateSubtitle() {
-    if (!video || !sentences.length || identity() !== learningSourceIdentity) {
+    if (view !== "study" || panelDismissed || !video || !sentences.length || identity() !== learningSourceIdentity || playerShowsAd(video)) {
       subtitle.textContent = "";
+      activeId = "";
       return;
     }
     const time = video.currentTime;
@@ -1056,7 +1335,8 @@
         row.append(translation);
       }
       row.addEventListener("click", () => {
-        if (!video || recording || recoveryPending || !mappedSentence(sentence)) return;
+        if (view !== "study" || busy || recording || recoveryPending || !mappedSentence(sentence) || !activateStudyVideo()) return;
+        if (playerShowsAd(video)) { showStatus("请等广告结束后再回听这句。", true); return; }
         video.currentTime = sentence.start;
         void Promise.resolve(video.play()).catch(() => showStatus("请点击视频播放器继续播放。", true));
         updateSubtitle();
@@ -1111,15 +1391,17 @@
           toggle.textContent = detail.hidden ? "解析" : "收起解析";
         });
         entry.append(toggle, detail);
+        if (displayCaptureId) entry.append(reviewPanel.favoriteButton(displayCaptureId, sentence.id));
       }
       list.append(entry);
       rows.push({ element: entry, button: row, sentence });
     }
     list.scrollTop = scrollTop;
     updateSeekAvailability();
-    video?.addEventListener("timeupdate", updateSubtitle);
+    if (view === "study") activateStudyVideo();
     activeId = "";
     updateSubtitle();
+    updateStudyActions();
     if (sentences.length && !captureFormAutoCollapsed && !captureFormUserOpened && !status.classList.contains("error")) {
       captureForm.open = false;
       captureFormAutoCollapsed = true;
@@ -1144,8 +1426,14 @@
     }
     if (message.type === "page-handshake") {
       sendResponse(pageInfo());
+    } else if (message.type === "capture-idle") {
+      openIdle();
+      sendResponse({ ok: true });
+    } else if (message.type === "review-selected") {
+      sendResponse(openSavedClip(message.captureId));
     } else if (message.type === "status") {
-      showStatus(message.text, message.error);
+      showStatus(captureFailure === "advertisement_started"
+        ? "广告中断了本段。请在播放器继续播放，广告结束后点击「重试本段」。" : message.text, message.error);
       sendResponse({ ok: true });
     } else if (message.type === "capture-show") {
       panelDismissed = false;
@@ -1163,6 +1451,8 @@
       });
       return true;
     } else if (message.type === "result") {
+      sourceIdentity = identity();
+      setView("study");
       renderResult(message.result);
       sendResponse({ ok: true });
     } else if (message.sessionId !== sessionId) return;
@@ -1172,8 +1462,12 @@
     } else if (message.type === "capture-saved") {
       transcriptionEnabled = message.transcriptionEnabled === true;
       enrichmentEnabled = message.enrichmentEnabled === true;
+      takeComplete = true;
+      completedRange = readRange(message.manifest) || (submittedRange && { start: submittedRange.rangeStart, end: submittedRange.rangeEnd });
       if (transcriptionEnabled) startTranscriptionPolling(message.manifest.id);
       if (enrichmentEnabled) startLearningPolling(message.manifest.id);
+      else showStatus("片段录音已保存。本次未启用完整的学习内容生成。");
+      updateStudyActions();
       try { showSaved(message.manifest); sendResponse({ ok: true }); }
       catch (error) { showStatus(error.message, true); sendResponse({ ok: false, error: error.message }); }
     } else if (message.type === "capture-stop-playback") {
@@ -1186,12 +1480,13 @@
       cancelPreparation();
       configured = false;
       busy = false;
-      updateBeginAvailability();
+      captureFailure = message.code === "advertisement_started" ? "advertisement_started" : "interrupted";
       cancel.disabled = false;
       setInputsDisabled(false);
+      setView("working");
       sendResponse({ ok: true });
     } else if (message.type === "capture-reset") {
-      if (!message.complete) { stopTranscriptionPolling(); stopLearningPolling(); suspendLearningDisplay(); }
+      if (!message.complete) resetLearningView();
       cancelPreparation();
       stopPlayback();
       configured = false;
@@ -1199,15 +1494,17 @@
       recoveryPending = false;
       audioReleased = true;
       cancel.disabled = true;
-      updateBeginAvailability();
       setInputsDisabled(reconnecting);
-      if (!message.complete) metrics.textContent = "";
-      updateSeekAvailability();
+      if (!message.complete) setView("setup");
+      else {
+        updateBeginAvailability();
+        updateSeekAvailability();
+      }
       sendResponse({ ok: true });
     } else if (message.type === "prepare" || message.type === "play") {
       const action = message.type === "prepare" ? prepare(message) : play(message.sessionId);
       action.then((value) => sendResponse({ ok: true, ...value }))
-        .catch((error) => sendResponse({ ok: false, error: error.message }));
+        .catch((error) => sendResponse({ ok: false, error: error.message, ...(error.code === "advertisement_started" ? { code: error.code } : {}) }));
       return true;
     }
   });

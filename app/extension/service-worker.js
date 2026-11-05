@@ -1,13 +1,15 @@
 const SESSION_KEY = "activeCapture";
 const API = "http://127.0.0.1:8766";
-const PAGE_VERSION = "0.5.4";
+const PAGE_VERSION = "0.6.0";
 const PAGE_PROTOCOL = 1;
 let creatingOffscreen;
 let opening = false;
 let releasing;
+const reviewOpening = new Set();
+const reviewRestoring = new Map();
 const REARM_BUSY = "正在连接音频，请稍候后重试。";
 const REARM_ACTIVE = "已有采集任务，请先中断／释放音频后重试。";
-const REARM_FALLBACK = "音频未重新连接，请点击浏览器工具栏 S 重新连接音频。";
+const REARM_FALLBACK = "音频未连接，请点击浏览器工具栏 S，再点击生成学习内容。";
 
 async function within(promise, milliseconds, message) {
   let timer;
@@ -49,7 +51,7 @@ async function ensurePage(tabId) {
   let injected;
   const injectionTimeout = failure("inject_timeout", "页面脚本注入超过 3 秒。");
   try {
-    injected = await within(chrome.scripting.executeScript({ target: { tabId }, files: ["page.js"] }),
+    injected = await within(chrome.scripting.executeScript({ target: { tabId }, files: ["review.js", "page.js"] }),
       3000, injectionTimeout);
   } catch (error) {
     if (error === injectionTimeout) throw error;
@@ -119,12 +121,23 @@ function validVideoUrl(value) {
   } catch (_) { return false; }
 }
 
+
+function validRange(start, end) {
+  return Number.isFinite(start) && Number.isFinite(end) && start >= 0 && end - start >= 1 && end - start <= 1800;
+}
+
+function adFailureCode(value) {
+  return value === "advertisement_started" ? value : undefined;
+}
+
 async function showCaptureRecovery(active, inspected, recoveryState) {
   const count = (value) => Number.isSafeInteger(value) && value >= 0 && value <= 1_000_000_000 ? value : null;
   const pendingBatches = count(inspected?.pendingBatches);
   const pendingBytes = count(inspected?.pendingBytes);
   const reply = await within(pageMessage(active.tabId, {
     type: "capture-recovery", sessionId: active.sessionId, recoveryState, pendingBatches, pendingBytes,
+    ...(validRange(active.rangeStart, active.rangeEnd) ? { rangeStart: active.rangeStart, rangeEnd: active.rangeEnd } : {}),
+    ...(adFailureCode(active.failureCode) ? { code: active.failureCode } : {}),
     transcriptionEnabled: active.transcriptionEnabled === true,
     enrichmentEnabled: active.enrichmentEnabled === true,
   }), 3000, "无法显示旧采集任务的恢复控件，请刷新视频页面后重试。");
@@ -153,6 +166,7 @@ async function openAgent(tab, { freshOnly = false, rearmRequestId } = {}) {
     if (releasing) await within(releasing, 4000, "上次音频环境仍在关闭，请稍后重新点击扩展图标。");
     if (!tab.id || !validVideoUrl(tab.url)) throw new Error("请先打开 YouTube 视频或 Shorts 页面。");
     if (freshOnly) {
+      if (reviewOpening.has(tab.id) || reviewRestoring.has(tab.id)) return { ok: false, error: "正在打开复习片段，请稍候。" };
       const currentTab = await chrome.tabs.get(tab.id);
       if (currentTab.id !== tab.id || currentTab.active !== true || currentTab.url !== tab.url) {
         return { ok: false, error: REARM_FALLBACK };
@@ -201,7 +215,8 @@ async function openAgent(tab, { freshOnly = false, rearmRequestId } = {}) {
               ? "音频已准备。选择范围后点击开始；开始采集后将分批发送 Google 转写。"
               : "音频已准备。选择范围后点击开始；尚未录音。");
           } else if (inspected?.ok && inspected.phase === "failed") {
-            await showCaptureRecovery(active, inspected, "failed");
+            const sameVideo = canonicalVideo(active.sourceUrl)?.id === canonicalVideo(tab.url)?.id;
+            await showCaptureRecovery(active, inspected, sameVideo ? "failed" : "source_changed");
           } else if (inspected?.ok && ["recording", "saving"].includes(inspected.phase)) {
             await showCaptureRecovery(active, inspected, inspected.phase);
           } else {
@@ -212,6 +227,12 @@ async function openAgent(tab, { freshOnly = false, rearmRequestId } = {}) {
       }
       // No offscreen document means its in-memory queue is already gone; keep disk batches untouched.
       await chrome.storage.session.remove(SESSION_KEY);
+    }
+    if (!freshOnly) {
+      await notify(tab.id, "已打开学习面板。选择复习片段，或生成新的学习内容。");
+      await showIdle(tab.id);
+      await restorePendingReview(tab, true);
+      return { ok: true, idle: true };
     }
     await notify(tab.id, "正在连接本机采集服务…");
     const controller = new AbortController();
@@ -292,8 +313,21 @@ async function handleMessage(message, sender) {
         type: "prepare", sessionId: session.sessionId, rangeStart: message.rangeStart,
         rangeEnd: message.rangeEnd, batchIntervalMs: message.batchIntervalMs,
       }), 12_000, "视频跳转准备超时，请中断后重试。");
-      if (!prepared?.ok) throw new Error(prepared?.error || "视频准备失败");
+      if (!prepared?.ok) {
+        const code = adFailureCode(prepared?.code);
+        if (code && validRange(message.rangeStart, message.rangeEnd)) {
+          await checkCurrent(session);
+          Object.assign(session, { rangeStart: message.rangeStart, rangeEnd: message.rangeEnd, failureCode: code });
+          await chrome.storage.session.set({ [SESSION_KEY]: session });
+        }
+        throw Object.assign(new Error(prepared?.error || "视频准备失败"), { code });
+      }
       await checkCurrent(session);
+      if (!validRange(prepared.rangeStart, prepared.rangeEnd) || !Number.isFinite(prepared.duration) || prepared.rangeEnd > prepared.duration) {
+        throw new Error("视频准备返回了无效的采集范围。");
+      }
+      session.rangeStart = prepared.rangeStart;
+      session.rangeEnd = prepared.rangeEnd;
       session.phase = "recording";
       await chrome.storage.session.set({ [SESSION_KEY]: session });
       const started = await offscreenMessage({ type: "capture-start", ...session, ...prepared });
@@ -329,15 +363,19 @@ async function handleMessage(message, sender) {
       try {
         const reply = await within(offscreenMessage({ type: "capture-abort", sessionId: session.sessionId }),
           4000, "采集中断确认超时");
-        confirmed = Boolean(reply?.ok);
+        confirmed = reply?.ok === true && reply.abortConfirmed === true;
       } catch (_) { /* Closing the explicitly cancelled document is still required. */ }
       finally { await finish(session); }
       await status(session.tabId, confirmed
-        ? "已中断并释放浏览器待确认数据。后端已确认的批次仍保留在本机。"
-        : "已释放浏览器采集环境，但后端中断状态未确认；已保存的批次保留，请检查本机任务。", !confirmed);
-      break;
+        ? "本段已停止，已保存的内容仍保留。"
+        : "录音已停止，但本机服务未确认任务已结束。请检查本机服务。", !confirmed);
+      return { ok: true, abortConfirmed: confirmed };
     }
     case "page-error": {
+      if (adFailureCode(message.failure?.code)) {
+        session.failureCode = message.failure.code;
+        await chrome.storage.session.set({ [SESSION_KEY]: session });
+      }
       await pageMessage(session.tabId, { type: "capture-stop-playback", sessionId: session.sessionId }).catch(() => {});
       await within(offscreenMessage({ type: "capture-fail", sessionId: session.sessionId, error: message.error,
         failure: message.failure, playbackEndVideoSec: message.playbackEndVideoSec, playbackEvents: message.playbackEvents }),
@@ -361,9 +399,12 @@ async function handleMessage(message, sender) {
     case "capture-expired":
     case "capture-error":
       await pageMessage(session.tabId, { type: "capture-stop-playback", sessionId: session.sessionId }).catch(() => {});
+      await checkCurrent(session);
       session.phase = "failed";
+      const code = adFailureCode(message.code) || adFailureCode(session.failureCode);
+      if (code) session.failureCode = code;
       await chrome.storage.session.set({ [SESSION_KEY]: session });
-      await pageMessage(session.tabId, { type: "capture-failed", sessionId: session.sessionId }).catch(() => {});
+      await pageMessage(session.tabId, { type: "capture-failed", sessionId: session.sessionId, ...(code ? { code } : {}) }).catch(() => {});
       await status(session.tabId, `采集未完成：${message.error}。已确认批次保留在本机。` +
         (message.pendingBatches
           ? `待确认 ${message.pendingBatches} 批（${message.pendingBytes || 0} 字节）保留在浏览器，点击“中断／释放音频”后丢弃。`
@@ -401,7 +442,38 @@ async function transcriptionStatus(captureId) {
 }
 
 function validCaptureId(value) {
-  return /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(value || "");
+  return typeof value === "string" && /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(value);
+}
+
+function validSentenceId(value) {
+  return typeof value === "string" && /^[a-zA-Z0-9_-]{1,100}$/.test(value);
+}
+
+function canonicalVideo(value) {
+  if (typeof value !== "string" || value.length > 2048) return null;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || !["www.youtube.com", "youtube.com"].includes(url.hostname) || url.port || url.username || url.password) return null;
+    const short = /^\/shorts\/([a-zA-Z0-9_-]{11})\/?$/.exec(url.pathname);
+    const watch = url.pathname === "/watch" && url.searchParams.getAll("v");
+    const id = short?.[1] || (watch?.length === 1 ? watch[0] : "");
+    if (!/^[a-zA-Z0-9_-]{11}$/.test(id)) return null;
+    return { id, url: short ? `https://www.youtube.com/shorts/${id}` : `https://www.youtube.com/watch?v=${id}` };
+  } catch (_) { return null; }
+}
+
+function safeTimestamp(value) {
+  return Number.isFinite(value) && value >= 0 && value <= 8.64e12 ? value : null;
+}
+
+function safeClip(value, captureId) {
+  const source = canonicalVideo(value?.source_url);
+  const updatedAt = safeTimestamp(value?.updated_at);
+  if (!validCaptureId(value?.capture_id) || (captureId && value.capture_id !== captureId) || !source || updatedAt === null ||
+      !validRange(value.range_start_sec, value.range_end_sec) || !Number.isSafeInteger(value.sentences_done) ||
+      value.sentences_done < 0 || value.sentences_done > 1_000_000) return null;
+  return { capture_id: value.capture_id, source_url: source.url, range_start_sec: value.range_start_sec,
+    range_end_sec: value.range_end_sec, updated_at: updatedAt, sentences_done: value.sentences_done };
 }
 
 function annotatedReading(text, reading) {
@@ -437,7 +509,7 @@ function safeLearningResult(value) {
   const seconds = (item) => typeof item === "number" && Number.isFinite(item) && item >= 0 ? item : null;
   for (const item of Array.isArray(value?.sentences) ? value.sentences.slice(0, 10000) : []) {
     const study = item?.study;
-    if (!study || study.style_version !== 2 || !/^[a-zA-Z0-9_-]{1,100}$/.test(item.id || "") || ids.has(item.id)) continue;
+    if (!study || study.style_version !== 2 || !validSentenceId(item.id) || ids.has(item.id)) continue;
     if (!annotatedReading(item.text, study.reading_text)) continue;
     const translation = text(item.translation_zh, 16000);
     const points = Array.isArray(study.key_points) ? study.key_points : [];
@@ -466,7 +538,7 @@ function safeLearningStatus(value, captureId) {
     blocked_batches: Array.isArray(value?.blocked_batches) ? value.blocked_batches.length : count(value?.blocked_batches),
     result_available: result.sentences.length > 0,
     revision: Number.isSafeInteger(value?.revision) && value.revision >= 0 ? value.revision : 0,
-    result };
+    clip: safeClip(value?.clip, captureId), result };
 }
 
 async function learningStatus(path, captureId) {
@@ -482,8 +554,137 @@ async function learningStatus(path, captureId) {
   } finally { clearTimeout(timer); }
 }
 
+async function reviewRequest(path, payload) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const options = { signal: controller.signal, credentials: "omit", redirect: "error" };
+    if (payload !== undefined) Object.assign(options, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+    });
+    const response = await fetch(`${API}${path}`, options);
+    if (response.status === 404 && ["/learning/library", "/learning/favorites"].includes(path)) {
+      throw Object.assign(new Error("Local review API needs an update"), { code: "backend_upgrade_required" });
+    }
+    if (!response.ok) throw new Error("Local review request unavailable");
+    return await response.json();
+  } finally { clearTimeout(timer); }
+}
+
+function safeFavorite(value) {
+  const source = canonicalVideo(value?.source_url);
+  const savedAt = safeTimestamp(value?.saved_at);
+  if (!validCaptureId(value?.capture_id) || !validSentenceId(value?.sentence_id) || !source || savedAt === null) return null;
+  const [sentence] = safeLearningResult({ sentences: [value.sentence] }).sentences;
+  if (sentence?.id !== value.sentence_id) return null;
+  return { capture_id: value.capture_id, sentence_id: value.sentence_id, source_url: source.url, saved_at: savedAt, sentence };
+}
+
+function pendingReviewKey(tabId) { return `pendingReview:${tabId}`; }
+
+async function showIdle(tabId) {
+  const reply = await within(pageMessage(tabId, { type: "capture-idle" }), 3000, "学习面板未响应，请刷新页面后重试。");
+  if (reply?.ok !== true) throw new Error("学习面板未响应，请刷新页面后重试。");
+}
+
+async function selectReviewClip(tabId, captureId) {
+  const reply = await within(pageMessage(tabId, { type: "review-selected", captureId }), 3000, "复习面板未响应，请重新打开扩展。");
+  if (reply?.ok !== true) throw new Error("复习面板未响应，请重新打开扩展。");
+}
+
+function restorePendingReview(tab, pageReady = false) {
+  const tabId = tab.id;
+  if (!Number.isSafeInteger(tabId) || tabId <= 0 || !validVideoUrl(tab.url)) return Promise.resolve(false);
+  const running = reviewRestoring.get(tabId);
+  if (running) return running;
+  const work = (async () => {
+    const key = pendingReviewKey(tabId);
+    const pending = (await chrome.storage.session.get(key))[key];
+    if (!validCaptureId(pending?.captureId) || canonicalVideo(tab.url)?.id !== pending.videoId) return false;
+    const active = (await chrome.storage.session.get(SESSION_KEY))[SESSION_KEY];
+    if (active?.tabId === tabId) return false;
+    if (!pageReady) { await ensurePage(tabId); await showIdle(tabId); }
+    const current = await chrome.tabs.get(tabId);
+    if (current.id !== tabId || canonicalVideo(current.url)?.id !== pending.videoId) return false;
+    const latest = (await chrome.storage.session.get(key))[key];
+    if (latest?.captureId !== pending.captureId || latest.videoId !== pending.videoId) return false;
+    await selectReviewClip(tabId, pending.captureId);
+    await chrome.storage.session.remove(key);
+    return true;
+  })();
+  reviewRestoring.set(tabId, work);
+  const clear = () => { if (reviewRestoring.get(tabId) === work) reviewRestoring.delete(tabId); };
+  void work.then(clear, clear);
+  return work;
+}
+
+async function openReviewClip(tabId, sourceUrl, captureId) {
+  if (opening || reviewOpening.has(tabId) || reviewRestoring.has(tabId)) return { ok: false, error: "页面正在切换，请稍候后重试。" };
+  reviewOpening.add(tabId);
+  try {
+    const ensureCanOpen = async () => {
+      const current = await chrome.tabs.get(tabId);
+      if (current.id !== tabId || !validVideoUrl(current.url) || canonicalVideo(current.url)?.id !== canonicalVideo(sourceUrl)?.id) {
+        return { error: "视频页面已切换，请重新打开复习面板。" };
+      }
+      const active = (await chrome.storage.session.get(SESSION_KEY))[SESSION_KEY];
+      if (active?.tabId === tabId) return { error: "请先中断／释放当前采集，再打开复习片段。" };
+      return current;
+    };
+    const before = await ensureCanOpen();
+    if (before.error) return { ok: false, error: before.error };
+    const value = await reviewRequest(`/captures/${captureId}/learning`).catch(() => null);
+    const clip = safeClip(value?.clip, captureId);
+    if (!clip) return { ok: false, error: "无法确认该片段的原视频，请重新读取复习列表。" };
+    const current = await ensureCanOpen();
+    if (current.error) return { ok: false, error: current.error };
+    const target = canonicalVideo(clip.source_url);
+    const key = pendingReviewKey(tabId);
+    if (canonicalVideo(current.url)?.id === target.id) {
+      await selectReviewClip(tabId, captureId);
+      await chrome.storage.session.remove(key);
+      return { ok: true, navigated: false };
+    }
+    await chrome.storage.session.set({ [key]: { captureId, videoId: target.id } });
+    try { await chrome.tabs.update(tabId, { url: target.url }); }
+    catch (_) {
+      await chrome.storage.session.remove(key);
+      return { ok: false, error: "无法打开原视频，请重新选择复习片段。" };
+    }
+    return { ok: true, navigated: true };
+  } finally { reviewOpening.delete(tabId); }
+}
+
+async function handleReview(message, sender) {
+  if (message.type === "review-library") {
+    const value = await reviewRequest("/learning/library");
+    return { ok: true,
+      clips: Array.isArray(value?.clips) ? value.clips.slice(0, 10_000).map((item) => safeClip(item)).filter(Boolean) : [],
+      favorites: Array.isArray(value?.favorites) ? value.favorites.slice(0, 10_000).map(safeFavorite).filter(Boolean) : [],
+    };
+  }
+  if (message.type === "review-favorite") {
+    const value = await reviewRequest("/learning/favorites", { capture_id: message.captureId, sentence_id: message.sentenceId, saved: message.saved });
+    if (typeof value?.saved !== "boolean") throw new Error("Invalid local favorite acknowledgement");
+    return { ok: true, saved: value.saved };
+  }
+  return openReviewClip(sender.tab.id, sender.url || sender.tab.url, message.captureId);
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.target !== "worker") return;
+  if (["review-library", "review-favorite", "review-open"].includes(message.type)) {
+    if (sender.id !== chrome.runtime.id || !Number.isSafeInteger(sender.tab?.id) || sender.tab.id <= 0 || sender.frameId !== 0 ||
+        !validVideoUrl(sender.url || sender.tab.url) || (message.type !== "review-library" && !validCaptureId(message.captureId)) ||
+        (message.type === "review-favorite" && (!validSentenceId(message.sentenceId) || typeof message.saved !== "boolean"))) {
+      sendResponse({ ok: false, error: "复习请求无效。" });
+      return;
+    }
+    handleReview(message, sender).then(sendResponse).catch((error) => sendResponse(error?.code === "backend_upgrade_required"
+      ? { ok: false, code: "backend_upgrade_required", error: "请重启本机后端，加载收藏与复习功能。" }
+      : { ok: false, error: "无法完成本机复习操作，请重试。" }));
+    return true;
+  }
   if (message.type === "capture-rearm") {
     if (sender.id !== chrome.runtime.id || !Number.isSafeInteger(sender.tab?.id) || sender.tab.id <= 0 ||
         sender.frameId !== 0 || !validVideoUrl(sender.url) ||
@@ -530,21 +731,33 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   handleMessage(message, sender).then(sendResponse).catch(async (error) => {
+    const directCode = adFailureCode(error.code);
     const session = (await chrome.storage.session.get(SESSION_KEY))[SESSION_KEY];
     if (session && session.sessionId === message.sessionId && sender.id === chrome.runtime.id &&
         ((sender.tab?.id === session.tabId && sender.frameId === 0) || (!sender.tab && sender.url === chrome.runtime.getURL("offscreen.html")))) {
-      await within(offscreenMessage({ type: "capture-fail", sessionId: session.sessionId, error: error.message }),
+      const code = directCode || adFailureCode(session.failureCode);
+      await within(offscreenMessage({ type: "capture-fail", sessionId: session.sessionId, error: error.message,
+        ...(code ? { failure: { code, message: "当前播放器正在播放广告。" } } : {}) }),
         4000, "采集错误状态确认超时").catch(() => {});
-      session.phase = "failed";
-      await chrome.storage.session.set({ [SESSION_KEY]: session });
-      await pageMessage(session.tabId, { type: "capture-failed", sessionId: session.sessionId }).catch(() => {});
+      const latest = (await chrome.storage.session.get(SESSION_KEY))[SESSION_KEY];
+      if (latest?.sessionId === session.sessionId) {
+        latest.phase = "failed";
+        if (code) latest.failureCode = code;
+        await chrome.storage.session.set({ [SESSION_KEY]: latest });
+        await pageMessage(session.tabId, { type: "capture-failed", sessionId: session.sessionId, ...(code ? { code } : {}) }).catch(() => {});
+      }
     }
-    sendResponse({ ok: false, error: error.message });
+    sendResponse({ ok: false, error: error.message, ...(directCode ? { code: directCode } : {}) });
   });
   return true;
 });
 
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status === "complete") void restorePendingReview({ id: tabId, url: tab.url }).catch(() => {});
+});
+
 chrome.tabs.onRemoved.addListener((tabId) => {
+  void chrome.storage.session.remove(pendingReviewKey(tabId)).catch(() => {});
   void chrome.storage.session.get(SESSION_KEY).then(async (data) => {
     const session = data[SESSION_KEY];
     if (session?.tabId !== tabId) return;

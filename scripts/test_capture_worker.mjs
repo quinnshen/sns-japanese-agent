@@ -8,7 +8,7 @@ const extensionId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const origin = `chrome-extension://${extensionId}/`;
 const videoUrl = "https://www.youtube.com/watch?v=AbCdEf012_-";
 const tab = { id: 7, url: videoUrl, active: true };
-const pageMetadata = { ok: true, version: "0.5.4", protocol: 1 };
+const pageMetadata = { ok: true, version: "0.6.0", protocol: 1 };
 const tick = async () => { for (let i = 0; i < 120; i++) await Promise.resolve(); };
 async function until(check) { for (let i = 0; i < 20; i++) { if (check()) return; await tick(); } assert.ok(check(), "Lifecycle did not reach expected state"); }
 function deferred() { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; }
@@ -24,8 +24,10 @@ function workerHarness({ initial, documentExists = false, inspect = { ok: true, 
   transcriptionEnabled = false, transcriptionReply = {}, injectionResults = [{ frameId: 0, result: pageMetadata }],
   handshakeReply = pageMetadata, statusUnavailable = false, enrichmentEnabled = false,
   learningReply = {}, latestLearningReply = learningReply, currentTabUrl = videoUrl,
-  currentTabActive = true, currentTabId = tab.id, closeDocument, configuringReply = { ok: true } } = {}) {
-  const timer = clock(); let action; let listener; let stored = initial; let contexts = documentExists;
+  currentTabActive = true, currentTabId = tab.id, closeDocument, configuringReply = { ok: true }, prepareReply,
+  libraryReply = {}, favoriteReply = { saved: true }, reviewStatus = 200, failUpdate = false } = {}) {
+  const timer = clock(); let action; let listener; let updated; let removed; let stored = initial; let contexts = documentExists;
+  const pending = new Map(); const navigations = [];
   let pageSessionId;
   let serial = 0; let closeCount = 0; let streamCalls = 0; let createCount = 0; let contextCalls = 0;
   const pageMessages = []; const offscreenMessages = []; const fetches = [];
@@ -43,14 +45,19 @@ function workerHarness({ initial, documentExists = false, inspect = { ok: true, 
       async sendMessage(message) {
         offscreenMessages.push(structuredClone(message));
         if (message.type === "capture-inspect") return typeof inspect === "function" ? inspect() : inspect;
-        if (message.type === "capture-abort" && stallAbort) return new Promise(() => {});
+        if (message.type === "capture-abort") return stallAbort ? new Promise(() => {}) : { ok: true, abortConfirmed: true };
         return { ok: true };
       },
     },
     storage: { session: {
-      async get() { return { activeCapture: stored && structuredClone(stored) }; },
-      async set(value) { stored = structuredClone(value.activeCapture); },
-      async remove() { stored = undefined; },
+      async get(key) { return { [key]: structuredClone(key === "activeCapture" ? stored : pending.get(key)) }; },
+      async set(value) {
+        for (const [key, item] of Object.entries(value)) {
+          if (key === "activeCapture") stored = structuredClone(item);
+          else pending.set(key, structuredClone(item));
+        }
+      },
+      async remove(key) { if (key === "activeCapture") stored = undefined; else pending.delete(key); },
     } },
     scripting: { async executeScript(value) {
       lifecycle.push("inject"); injections.push(structuredClone(value));
@@ -59,7 +66,13 @@ function workerHarness({ initial, documentExists = false, inspect = { ok: true, 
     offscreen: { async createDocument() { lifecycle.push("create-offscreen"); contexts = true; createCount++; }, async closeDocument() { closeCount++; if (closeDocument) await closeDocument(); contexts = false; } },
     tabCapture: { async getMediaStreamId(options) { lifecycle.push("stream"); streamCalls++; streamArguments.push(structuredClone(options)); return streamId ? streamId(streamCalls) : "synthetic-stream"; } },
     tabs: {
-      async get(id) { tabGets.push(id); return { ...tab, id: currentTabId, url: currentTabUrl, active: currentTabActive }; }, async create() {}, onRemoved: { addListener() {} },
+      async get(id) { tabGets.push(id); return { ...tab, id: currentTabId, url: currentTabUrl, active: currentTabActive }; },
+      async create() {},
+      async update(id, value) {
+        if (failUpdate) throw new Error("Synthetic failed navigation");
+        navigations.push({ id, ...structuredClone(value) }); currentTabUrl = value.url;
+      },
+      onRemoved: { addListener(fn) { removed = fn; } }, onUpdated: { addListener(fn) { updated = fn; } },
       async sendMessage(tabId, message, options) {
         pageMessages.push(structuredClone(message)); pageTargets.push({ tabId, options: structuredClone(options) });
         if (["capture-configuring", "capture-recovery"].includes(message.type)) pageSessionId = message.sessionId;
@@ -70,6 +83,8 @@ function workerHarness({ initial, documentExists = false, inspect = { ok: true, 
         if (message.type === "capture-configuring") {
           return typeof configuringReply === "function" ? configuringReply() : structuredClone(configuringReply);
         }
+        if (message.type === "prepare") return prepareReply || { ok: true, duration: 100, url: currentTabUrl,
+          rangeStart: message.rangeStart, rangeEnd: message.rangeEnd, batchIntervalMs: message.batchIntervalMs };
         if (statusUnavailable && message.type === "status") throw new Error("Receiving end does not exist.");
         return { ok: true };
       },
@@ -78,45 +93,60 @@ function workerHarness({ initial, documentExists = false, inspect = { ok: true, 
   const context = vm.createContext({ chrome, URL, AbortController, ...timer, crypto: { randomUUID() { return `00000000-0000-4000-8000-${String(++serial).padStart(12, "0")}`; } },
     async fetch(url, options) {
       lifecycle.push("fetch"); fetches.push(url);
-      fetchOptions.push(structuredClone({ method: options?.method || "GET", credentials: options?.credentials }));
+      fetchOptions.push(structuredClone({ method: options?.method || "GET", credentials: options?.credentials,
+        ...(options?.body ? { body: JSON.parse(options.body) } : {}) }));
+      if (["/learning/library", "/learning/favorites"].includes(new URL(url).pathname) && reviewStatus !== 200) {
+        return { ok: false, status: reviewStatus, json: async () => ({ error: "synthetic-private-error" }) };
+      }
       return { ok: true, async json() {
         const path = new URL(url).pathname;
         if (path === "/health") return { capabilities: { capture_batches: true, capture_transcription: transcriptionEnabled, capture_enrichment: enrichmentEnabled } };
         if (path === "/learning/latest") return latestLearningReply;
+        if (path === "/learning/library") return libraryReply;
+        if (path === "/learning/favorites") return favoriteReply;
         if (path.endsWith("/learning")) return learningReply;
         return transcriptionReply;
       } };
     },
   });
   vm.runInContext(workerSource, context);
-  return { timer, pageMessages, offscreenMessages, fetches, fetchOptions, injections, badges, titles, lifecycle, pageTargets, streamArguments, tabGets,
+  const message = (payload, senderOverride = {}) => new Promise((resolve) => {
+    listener({ target: "worker", ...payload }, { id: extensionId, tab, frameId: 0, ...senderOverride }, resolve);
+  });
+  return { timer, pageMessages, offscreenMessages, fetches, fetchOptions, injections, badges, titles, lifecycle, pageTargets, streamArguments, tabGets, navigations, pending,
+    load(url = currentTabUrl) { updated(tab.id, { status: "complete" }, { ...tab, url }); },
+    remove() { removed(tab.id); },
+    arm: (requestId = 1) => message({ type: "capture-rearm", requestId }, { url: currentTabUrl }),
     click: (clickedTab = tab) => action(clickedTab), get stored() { return stored; }, get closeCount() { return closeCount; }, get streamCalls() { return streamCalls; },
     get pageSessionId() { return pageSessionId; },
     get createCount() { return createCount; }, get contextCalls() { return contextCalls; },
-    message: (payload, senderOverride = {}) => new Promise((resolve) => { listener({ target: "worker", ...payload }, { id: extensionId, tab, frameId: 0, ...senderOverride }, resolve); }),
+    message,
   };
 }
 {
   const h = workerHarness({ streamId: (attempt) => attempt === 1 ? new Promise(() => {}) : "retry-stream", stallAbort: true });
-  h.click(); await tick();
+  const first = h.arm(); await tick();
   assert.equal(h.stored.phase, "preparing");
   assert.ok(h.pageMessages.some((m) => m.type === "capture-configuring"));
   assert.equal(h.pageMessages.some((m) => m.type === "capture-configure"), false);
   await until(() => h.streamCalls === 1);
   h.timer.fire(10_000); await tick();
-  h.timer.fire(3000); await tick();
+  h.timer.fire(3000); assert.equal((await first).ok, false);
   assert.equal(h.stored, undefined, "Timed-out preparation must not lock the next extension action");
   assert.equal(h.closeCount, 1);
-  h.click(); await until(() => h.stored?.phase === "ready");
+  assert.equal((await h.arm()).ok, true);
   assert.equal(h.stored.phase, "ready");
   assert.equal(h.streamCalls, 2);
-  assert.ok(h.pageMessages.some((m) => m.type === "status" && /超时/.test(m.text)));
+  assert.ok(h.pageMessages.some((m) => m.type === "status" && /再点击生成学习内容/.test(m.text)));
   console.log("PASS preparation and cancellation waits expire; a new action can initialize again");
 }
 {
   const previous = { tabId: tab.id, sourceUrl: videoUrl, sessionId: "00000000-0000-4000-8000-000000000099", phase: "preparing" };
   const h = workerHarness({ initial: previous });
-  h.click(); await until(() => h.stored?.phase === "ready");
+  h.click(); await until(() => h.pageMessages.some((m) => m.type === "capture-idle")); await tick();
+  assert.equal(h.stored, undefined);
+  assert.equal(h.streamCalls, 0);
+  assert.equal((await h.arm()).ok, true);
   assert.equal(h.stored.phase, "ready");
   assert.notEqual(h.stored.sessionId, previous.sessionId);
   assert.equal(h.streamCalls, 1);
@@ -145,7 +175,7 @@ function workerHarness({ initial, documentExists = false, inspect = { ok: true, 
     assert.equal((await h.message({ type: "capture-cancel", sessionId: h.pageSessionId })).ok, true);
     assert.equal(h.closeCount, 1);
     assert.equal(h.stored, undefined);
-    h.click(); await until(() => h.stored?.phase === "ready");
+    assert.equal((await h.arm()).ok, true);
     assert.notEqual(h.stored.sessionId, previous.sessionId);
     assert.equal(h.streamCalls, 1);
   }
@@ -156,10 +186,12 @@ function workerHarness({ initial, documentExists = false, inspect = { ok: true, 
   const h = workerHarness({ initial: previous, documentExists: true, stallAbort: true });
   const cancelled = h.message({ type: "capture-cancel", sessionId: previous.sessionId });
   await tick(); h.timer.fire(4000); await tick();
-  assert.equal((await cancelled).ok, true);
+  const reply = await cancelled;
+  assert.equal(reply.ok, true);
+  assert.equal(reply.abortConfirmed, false);
   assert.equal(h.stored, undefined);
   assert.equal(h.closeCount, 1);
-  assert.ok(h.pageMessages.some((m) => m.type === "status" && /后端中断状态未确认/.test(m.text)));
+  assert.ok(h.pageMessages.some((m) => m.type === "status" && /本机服务未确认/.test(m.text)));
   console.log("PASS explicit cancellation releases a hung preparation with an unknown-backend-state message");
 }
 {
@@ -215,7 +247,7 @@ function mediaHarness({ acquisition, resume } = {}) {
 {
   for (const enabled of [false, true]) {
     const h = workerHarness({ transcriptionEnabled: enabled });
-    h.click(); await until(() => h.pageMessages.some((m) => m.type === "status" && m.text.startsWith("选择采集范围")));
+    assert.equal((await h.arm()).ok, true);
     assert.equal(h.stored.transcriptionEnabled, enabled);
     assert.equal(h.pageMessages.find((m) => m.type === "capture-configuring").transcriptionEnabled, enabled);
     assert.equal(h.pageMessages.find((m) => m.type === "capture-configure").transcriptionEnabled, enabled);
@@ -332,18 +364,18 @@ function assertDiagnostic(h, code) {
 }
 {
   const h = workerHarness();
-  h.click(); await until(() => h.stored?.phase === "ready");
-  assert.deepEqual(h.lifecycle.slice(0, 3), ["inject", "handshake", "fetch"]);
-  assert.equal(h.injections.length, 1);
-  assert.deepEqual(h.injections[0], { target: { tabId: tab.id }, files: ["page.js"] });
+  h.click(); await until(() => h.pageMessages.some((m) => m.type === "capture-idle")); await tick();
+  assert.deepEqual(h.lifecycle, ["inject", "handshake"]);
+  assert.deepEqual(h.injections[0], { target: { tabId: tab.id }, files: ["review.js", "page.js"] });
   assert.equal(h.pageMessages[0].type, "page-handshake");
   assert.equal(h.pageMessages[0].version, pageMetadata.version);
   assert.equal(h.pageMessages[0].protocol, pageMetadata.protocol);
-  assert.equal(h.createCount, 1);
+  assert.equal(h.createCount, 0);
+  assert.equal(h.streamCalls, 0);
+  assert.equal(h.stored, undefined);
+  assert.equal((await h.arm()).ok, true);
   assert.equal(h.streamCalls, 1);
-  assert.equal(h.titles.at(-1)?.title.includes("刷新当前"), false,
-    "Normal readiness must reset an earlier action tooltip");
-  console.log("PASS verified current page code completes its handshake before normal capture preparation");
+  console.log("PASS toolbar shows idle learning without health, audio or cloud; only explicit generate arms capture");
 }
 {
   const previous = { tabId: tab.id, sourceUrl: videoUrl, sessionId: "00000000-0000-4000-8000-000000000099", phase: "failed" };
@@ -393,7 +425,7 @@ function assertDiagnostic(h, code) {
   h.click(); await tick();
   assertDiagnostic(h, "orphan_root");
   ready = true;
-  h.click(); await until(() => h.stored?.phase === "ready");
+  assert.equal((await h.arm()).ok, true);
   assert.equal(h.badges.at(-1).text, "JA");
   assert.equal(h.titles.at(-1).title.includes("[orphan_root]"), false);
   assert.equal(h.streamCalls, 1);
@@ -472,7 +504,7 @@ function readySentence(overrides = {}) {
 }
 {
   const h = workerHarness({ transcriptionEnabled: true, enrichmentEnabled: true });
-  h.click(); await until(() => h.pageMessages.some((message) => message.type === "status" && /GPT.*预生成/.test(message.text)));
+  assert.equal((await h.arm()).ok, true);
   assert.equal(h.stored.enrichmentEnabled, true);
   assert.equal(h.pageMessages.find((message) => message.type === "capture-configure").enrichmentEnabled, true);
   assert.match(h.titles.at(-1).title, /GPT.*预生成/);
@@ -494,7 +526,7 @@ function readySentence(overrides = {}) {
 }
 {
   const h = workerHarness({ transcriptionEnabled: false, enrichmentEnabled: true });
-  h.click(); await until(() => h.pageMessages.some((message) => message.type === "status" && message.text.startsWith("选择采集范围")));
+  assert.equal((await h.arm()).ok, true);
   assert.equal(h.stored.transcriptionEnabled, false);
   assert.equal(h.stored.enrichmentEnabled, false,
     "New-capture enrichment requires Google transcription even when saved-ASR enrichment is enabled on the backend");
@@ -578,7 +610,7 @@ function readySentence(overrides = {}) {
   assert.equal(h.closeCount, 0);
   assert.equal(h.pageMessages.some((message) => message.type === "capture-configure"), false);
   await h.message({ type: "capture-cancel", sessionId: h.pageSessionId });
-  h.click(changedTab); await until(() => h.stored?.phase === "ready");
+  assert.equal((await h.arm()).ok, true);
   assert.equal(h.stored.sourceUrl, changedTab.url);
   assert.notEqual(h.stored.sessionId, previous.sessionId);
   assert.equal(h.streamCalls, 1);
@@ -642,7 +674,7 @@ function readySentence(overrides = {}) {
     const h = workerHarness(options);
     const reply = await h.message({ type: "capture-rearm", requestId: 1 }, { url: videoUrl });
     assert.equal(reply.ok, false);
-    assert.match(reply.error, /请点击浏览器工具栏 S 重新连接音频/);
+    assert.match(reply.error, /请点击浏览器工具栏 S，再点击生成学习内容/);
     assert.deepEqual(h.tabGets, [tab.id]);
     assert.equal(h.injections.length, 0);
     assert.equal(h.fetches.length, 0);
@@ -665,6 +697,11 @@ function readySentence(overrides = {}) {
     assert.equal(h.injections.length, 1);
     handshake.resolve(pageMetadata);
     if (initial) assert.equal((await initial).ok, true);
+    else {
+      await until(() => h.pageMessages.some((message) => message.type === "capture-idle")); await tick();
+      assert.equal(h.streamCalls, 0);
+      assert.equal((await h.arm()).ok, true);
+    }
     await until(() => h.pageMessages.some((message) => message.type === "capture-configure"));
     assert.equal(h.createCount, 1);
     assert.equal(h.streamCalls, 1);
@@ -705,7 +742,7 @@ function readySentence(overrides = {}) {
   } });
   const reply = await h.message({ type: "capture-rearm", requestId: 1 }, { url: videoUrl });
   assert.equal(reply.ok, false);
-  assert.equal(reply.error, "音频未重新连接，请点击浏览器工具栏 S 重新连接音频。");
+  assert.equal(reply.error, "音频未连接，请点击浏览器工具栏 S，再点击生成学习内容。");
   assert.equal(JSON.stringify(reply).includes("synthetic-private-marker"), false);
   assert.equal(JSON.stringify(h.titles).includes("synthetic-private-marker"), false);
   assert.equal(h.stored, undefined);
@@ -713,7 +750,7 @@ function readySentence(overrides = {}) {
   assert.equal(h.offscreenMessages.filter((message) => message.type === "capture-abort").length, 1);
   assert.equal(h.offscreenMessages.some((message) => ["capture-arm", "capture-start"].includes(message.type)), false);
   assert.equal(h.pageMessages.some((message) => ["prepare", "play"].includes(message.type)), false);
-  h.click(); await until(() => h.stored?.phase === "ready");
+  assert.equal((await h.arm()).ok, true);
   assert.equal(h.streamCalls, 2);
   assert.equal(h.stored.phase, "ready");
   console.log("PASS denied panel capture permission returns a fixed toolbar fallback and releases failed preparation");
@@ -730,7 +767,7 @@ function readySentence(overrides = {}) {
   await tick(); h.timer.fire(4000); await tick();
   const reply = await rearmed;
   assert.equal(reply.ok, false);
-  assert.match(reply.error, /请点击浏览器工具栏 S 重新连接音频/);
+  assert.match(reply.error, /请点击浏览器工具栏 S，再点击生成学习内容/);
   assert.equal(h.createCount, 0);
   assert.equal(h.streamCalls, 0);
   assert.equal(h.fetches.length, 0);
@@ -762,7 +799,7 @@ function readySentence(overrides = {}) {
     "A UI request ID must not enter the recorder session or uploaded task");
   assert.equal("rearmRequestId" in h.stored, false);
   const toolbar = workerHarness();
-  toolbar.click(); await until(() => toolbar.pageMessages.some((message) => message.type === "capture-configure"));
+  toolbar.click(); await until(() => toolbar.pageMessages.some((message) => message.type === "capture-idle"));
   assert.equal(toolbar.pageMessages.some((message) => "rearmRequestId" in message), false);
   console.log("PASS all direct-rearm status and configuring messages carry the request ID while normal toolbar messages stay unchanged");
 }
@@ -771,7 +808,7 @@ function readySentence(overrides = {}) {
     const h = workerHarness({ configuringReply });
     const reply = await h.message({ type: "capture-rearm", requestId: 28 }, { url: videoUrl });
     assert.equal(reply.ok, false);
-    assert.match(reply.error, /请点击浏览器工具栏 S 重新连接音频/);
+    assert.match(reply.error, /请点击浏览器工具栏 S，再点击生成学习内容/);
     assert.equal(h.stored, undefined);
     assert.equal(h.createCount, 0);
     assert.equal(h.streamCalls, 0);
@@ -798,4 +835,135 @@ function readySentence(overrides = {}) {
   assert.equal(h.offscreenMessages.some((message) => message.type === "capture-arm"), false);
   console.log("PASS a timed-out configuring acknowledgement cannot revive a closed or cancelled rearm when it arrives late");
 }
-console.log("42 preparation, recovery, handshake, learning, rearm, diagnostic, status, and failure lifecycle checks passed.");
+const reviewId = "00000000-0000-4000-8000-000000000077";
+const reviewTarget = "https://www.youtube.com/shorts/ZyXwVu987_-";
+const savedClip = (sourceUrl = videoUrl) => ({ capture_id: reviewId, source_url: sourceUrl,
+  range_start_sec: 10, range_end_sec: 45, updated_at: 1234.5, sentences_done: 2 });
+{
+  const clip = { ...savedClip(`${videoUrl}&t=25&private=discard`), private_extra: "synthetic-private-marker" };
+  const favorite = { capture_id: reviewId, sentence_id: "s001", source_url: videoUrl, saved_at: 1235,
+    sentence: { ...readySentence(), raw_debug: "synthetic-private-marker" } };
+  const h = workerHarness({ libraryReply: { clips: [clip, savedClip("https://example.invalid")], favorites: [favorite,
+    { ...favorite, sentence_id: "another_sentence" }] }, learningReply: { status: "complete", clip } });
+  const library = await h.message({ type: "review-library" });
+  assert.equal(library.ok, true);
+  assert.equal(library.clips.length, 1);
+  assert.equal(library.favorites.length, 1);
+  assert.equal(library.clips[0].source_url, videoUrl);
+  assert.equal(library.favorites[0].sentence.study.reading_text, "何(なに)が必要(ひつよう)か。");
+  assert.equal("text" in library.favorites[0].sentence, false);
+  assert.equal(JSON.stringify(library).includes("synthetic-private-marker"), false);
+  const learning = await h.message({ type: "capture-learning-status", captureId: reviewId });
+  assert.equal(learning.learning.clip.capture_id, reviewId);
+  assert.equal(learning.learning.clip.source_url, videoUrl);
+  const favoriteReply = await h.message({ type: "review-favorite", captureId: reviewId, sentenceId: "s001", saved: true });
+  assert.equal(favoriteReply.saved, true);
+  assert.deepEqual(h.fetchOptions.at(-1), { method: "POST", credentials: "omit", body: {
+    capture_id: reviewId, sentence_id: "s001", saved: true,
+  } });
+  for (const [payload, sender] of [
+    [{ type: "review-library" }, { frameId: 1 }],
+    [{ type: "review-open", captureId: "../invalid" }, {}],
+    [{ type: "review-favorite", captureId: reviewId, sentenceId: "../invalid", saved: true }, {}],
+    [{ type: "review-favorite", captureId: reviewId, sentenceId: "s001", saved: 1 }, {}],
+    [{ type: "review-library" }, { id: "foreign" }],
+  ]) assert.equal((await h.message(payload, sender)).ok, false);
+  assert.deepEqual(h.fetches.map((url) => new URL(url).pathname), ["/learning/library", `/captures/${reviewId}/learning`, "/learning/favorites"]);
+  assert.equal(h.streamCalls, 0);
+  console.log("PASS review library and favorites validate senders, strip private fields, and use local read/save routes only");
+}
+{
+  const h = workerHarness({ learningReply: { clip: savedClip(`${videoUrl}&t=55`) } });
+  const reply = await h.message({ type: "review-open", captureId: reviewId, url: "https://example.invalid/forged" });
+  assert.equal(reply.ok, true);
+  assert.equal(reply.navigated, false);
+  assert.equal(h.navigations.length, 0);
+  assert.deepEqual(h.pageMessages.find((message) => message.type === "review-selected"), { type: "review-selected", captureId: reviewId });
+  assert.deepEqual(h.fetches.map((url) => new URL(url).pathname), [`/captures/${reviewId}/learning`]);
+  assert.equal(h.streamCalls, 0);
+  console.log("PASS same-video review selects exactly the requested clip without navigation or capture");
+}
+for (const grantLost of [false, true]) {
+  let grant = !grantLost;
+  const h = workerHarness({ learningReply: { clip: savedClip(`${reviewTarget}?feature=share&t=31`) },
+    injectionResults: () => {
+      if (!grant) throw new Error("Synthetic missing activeTab permission");
+      return [{ frameId: 0, result: pageMetadata }];
+    } });
+  const reply = await h.message({ type: "review-open", captureId: reviewId });
+  assert.equal(reply.ok, true);
+  assert.equal(reply.navigated, true);
+  assert.deepEqual(h.navigations, [{ id: tab.id, url: reviewTarget }]);
+  assert.deepEqual(h.pending.get(`pendingReview:${tab.id}`), { captureId: reviewId, videoId: "ZyXwVu987_-" });
+  h.load(); await tick();
+  if (grantLost) {
+    assert.equal(h.pageMessages.some((m) => m.type === "review-selected"), false);
+    assert.equal(h.pending.size, 1);
+    grant = true;
+    h.click({ ...tab, url: reviewTarget });
+  }
+  await until(() => h.pageMessages.some((m) => m.type === "review-selected")); await tick();
+  assert.deepEqual(h.pageMessages.filter((m) => m.type === "review-selected"), [{ type: "review-selected", captureId: reviewId }]);
+  assert.equal(h.pending.size, 0);
+  assert.equal(h.streamCalls, 0);
+  assert.equal(h.createCount, 0);
+  assert.deepEqual(h.fetches.map((url) => new URL(url).pathname), [`/captures/${reviewId}/learning`]);
+}
+console.log("PASS cross-video review restores the exact pending clip on load or the next toolbar grant, without arming");
+{
+  const h = workerHarness({ initial: { tabId: tab.id, phase: "recording" }, learningReply: { clip: savedClip(reviewTarget) } });
+  const reply = await h.message({ type: "review-open", captureId: reviewId });
+  assert.equal(reply.ok, false);
+  assert.match(reply.error, /中断／释放/);
+  assert.equal(h.fetches.length, 0);
+  assert.equal(h.navigations.length, 0);
+  const invalid = workerHarness({ learningReply: { clip: { ...savedClip(reviewTarget), capture_id: "00000000-0000-4000-8000-000000000078" } } });
+  assert.equal((await invalid.message({ type: "review-open", captureId: reviewId })).ok, false);
+  assert.equal(invalid.navigations.length, 0);
+  const failed = workerHarness({ learningReply: { clip: savedClip(reviewTarget) }, failUpdate: true });
+  assert.equal((await failed.message({ type: "review-open", captureId: reviewId })).ok, false);
+  assert.equal(failed.pending.size, 0);
+  console.log("PASS review cannot navigate an active capture, use mismatched clip metadata, or retain a failed navigation");
+}
+for (const preRoll of [false, true]) {
+  const code = "advertisement_started";
+  const h = workerHarness({ prepareReply: preRoll ? { ok: false, code, error: "请等待当前播放器的广告结束后再开始采集。" } : undefined,
+    inspect: { ok: true, phase: "failed", pendingBatches: 1, pendingBytes: 10 } });
+  assert.equal((await h.arm()).ok, true);
+  const sessionId = h.stored.sessionId;
+  const reply = await h.message({ type: "capture-begin", sessionId, rangeStart: 10, rangeEnd: 45, batchIntervalMs: 5000 });
+  assert.equal(reply.ok, !preRoll);
+  assert.equal(h.offscreenMessages.some((message) => message.type === "capture-start"), !preRoll);
+  if (!preRoll) {
+    await h.message({ type: "capture-error", sessionId, code, error: "当前播放器开始播放广告，采集已停止。" },
+      { tab: undefined, url: origin + "offscreen.html" });
+  } else assert.equal(reply.code, code);
+  assert.equal(h.stored.failureCode, code);
+  assert.equal(h.stored.rangeStart, 10);
+  assert.equal(h.stored.rangeEnd, 45);
+  assert.equal(h.pageMessages.find((m) => m.type === "capture-failed").code, code);
+  h.click(); await until(() => h.pageMessages.some((m) => m.type === "capture-recovery"));
+  const recovery = h.pageMessages.find((m) => m.type === "capture-recovery");
+  assert.equal(recovery.code, code);
+  assert.equal(recovery.rangeStart, 10);
+  assert.equal(recovery.rangeEnd, 45);
+}
+console.log("PASS pre-roll and mid-capture ad interruption retain a bounded code and original interval through recovery");
+{
+  const h = workerHarness({ reviewStatus: 404 });
+  for (const payload of [{ type: "review-library" }, { type: "review-favorite", captureId: reviewId, sentenceId: "s001", saved: true }]) {
+    const reply = await h.message(payload);
+    assert.equal(reply.ok, false);
+    assert.equal(reply.code, "backend_upgrade_required");
+    assert.match(reply.error, /重启本机后端/);
+    assert.equal(JSON.stringify(reply).includes("synthetic-private-error"), false);
+  }
+  const current = workerHarness();
+  const empty = await current.message({ type: "review-library" });
+  assert.equal(empty.ok, true);
+  assert.equal(empty.clips.length, 0);
+  assert.equal(empty.favorites.length, 0);
+  assert.equal(h.streamCalls, 0);
+  console.log("PASS missing review APIs explain backend restart while a real empty library remains a successful empty result");
+}
+console.log("48 preparation, recovery, review, learning, status, and failure lifecycle checks passed.");

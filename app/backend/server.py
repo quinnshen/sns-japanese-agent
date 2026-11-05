@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import threading
 import uuid
 from functools import lru_cache
@@ -12,8 +13,10 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from config import setting
+from capture_learning import LearningError
 from capture_store import CaptureError, CaptureStore
 from capture_transcription import TranscriptionError
+from learning_library import LibraryError, LearningLibrary, clip_metadata, run_retention_sweep
 from pipeline import MAX_DURATION_SECONDS, save_result, transcribe_media
 from enrich import enrich_result, local_api_key
 
@@ -28,6 +31,11 @@ jobs_lock = threading.Lock()
 @lru_cache(maxsize=8)
 def capture_store(root: Path) -> CaptureStore:
     return CaptureStore(root)
+
+
+@lru_cache(maxsize=8)
+def learning_library(root: Path) -> LearningLibrary:
+    return LearningLibrary(root, store_factory=capture_store)
 
 
 def transcription_enabled() -> bool:
@@ -364,8 +372,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self.send_json(200, {
                 "ok": True,
+                "service_version": "0.6.0",
                 "capabilities": {
                     "capture_batches": True,
+                    "learning_library": True,
+                    "learning_favorites": True,
                     "cloud_processing": setting("ENABLE_LEGACY_PIPELINE", "0") == "1" or transcription_enabled() or learning_enabled(),
                     "capture_transcription": transcription_enabled(),
                     "capture_enrichment": learning_enabled(),
@@ -373,6 +384,16 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
         parsed_path = urlparse(self.path)
+        if self.path == "/learning/library":
+            try:
+                self.send_json(200, learning_library(DATA_DIR).list())
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except LibraryError as error:
+                self.send_json(error.status, {"error": error.message})
+            except (OSError, ValueError, TypeError, KeyError, sqlite3.DatabaseError):
+                self.send_json(500, {"error": "Local learning library operation failed"})
+            return
         if parsed_path.path == "/learning/latest":
             try:
                 parameters = parse_qs(parsed_path.query)
@@ -389,12 +410,15 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 learning_match = re.fullmatch(r"/captures/([0-9a-f-]{36})/learning", self.path)
                 if learning_match:
-                    from capture_learning import LearningError, read_learning_status, read_learning_result
-                    capture_store(DATA_DIR / "captures").get(learning_match[1])
+                    from capture_learning import read_learning_status, read_learning_result
+                    manifest = capture_store(DATA_DIR / "captures").get(learning_match[1])
                     directory = DATA_DIR / "captures" / learning_match[1]
                     try:
-                        self.send_json(200, {**read_learning_status(directory), "result": read_learning_result(directory)})
-                    except LearningError:
+                        status = read_learning_status(directory)
+                        result = read_learning_result(directory)
+                        clip = clip_metadata(directory, manifest, status.get("sentences_done", 0))
+                        self.send_json(200, {**status, "result": result, "clip": clip})
+                    except (LearningError, LibraryError):
                         self.send_json(500, {"error": "Local learning storage operation failed"})
                     return
                 transcription_match = re.fullmatch(r"/captures/([0-9a-f-]{36})/transcription", self.path)
@@ -438,6 +462,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if self.reject_untrusted_request():
+            return
+        if self.path == "/learning/favorites":
+            try:
+                self.send_json(200, learning_library(DATA_DIR).set_favorite(self.capture_json()))
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except LibraryError as error:
+                self.send_json(error.status, {"error": error.message})
+            except CaptureError as error:
+                self.capture_error(error)
+            except (LearningError, OSError, ValueError, TypeError, KeyError, sqlite3.DatabaseError):
+                self.send_json(500, {"error": "Local learning library operation failed"})
             return
         learning_match = re.fullmatch(r"/captures/([0-9a-f-]{36})/learning", self.path)
         if learning_match:
@@ -536,4 +572,11 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     print(f"Listening on http://{HOST}:{PORT}; local batch capture ready")
-    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    with ThreadingHTTPServer((HOST, PORT), Handler) as http:
+        stop_retention = threading.Event()
+        threading.Thread(target=run_retention_sweep, args=(learning_library(DATA_DIR), stop_retention),
+                         daemon=True, name="capture-retention").start()
+        try:
+            http.serve_forever()
+        finally:
+            stop_retention.set()

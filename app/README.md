@@ -4,28 +4,35 @@ A Chrome extension and local Python service for Japanese video learning. Select 
 
 Real 90-second and five-minute capture and Google transcription acceptance has passed. The [Google stage](TRANSCRIPTION.md) processes saved captures or starts in the background while recording. The [learning-note stage](LEARNING.md) independently batches available sentences and saves notes for local display; its backend has produced 37/37 validated notes from a saved 90-second transcript. The user has confirmed basic Chrome learning interactions work in version 0.5.2; explanation accuracy still needs review. Both cloud stages require separate opt-in settings; 30–40 minute validation follows end-to-end integration.
 
-## Current capture workflow
+## Learn and review
+
+1. On a YouTube video, click **S** and choose a range. Shorts and videos up to three minutes default to the whole video. For longer videos the start defaults to the current position; choose an end, or select the whole video when it fits the 30-minute limit.
+2. Click **生成学习内容**. The extension connects audio, seeks to the start and plays the selected range at normal speed. Keep playback uninterrupted. Transcription and analysis can start while the audio is being recorded.
+3. Once the recording is saved and a sentence is ready, choose **从片段起点学习**. Listen again, expand the analysis or save a sentence with **收藏**. Remaining analysis can finish in the background. **学习下一段** prefills the previous segment's end; click Generate again after choosing the new end.
+4. To read something already saved, explicitly open **复习 → 最近片段** or **收藏句子**. Recent clips are grouped by video and open the exact range selected. If Chrome requires permission again after navigating to another video, click **S** on that video to open the selected clip.
+
+During generation, **停止生成** stops the current recording. If the player reports an ad, the extension stops recording and keeps confirmed data. Resume playback in the player, wait for the ad to finish, then choose **重试本段** to start the original range again. This is a new generation, not a continuation of the interrupted recording.
+
+## Audio capture
 
 ```text
 Click extension on a YouTube watch or Shorts page
-  → Choose start/end video time and upload interval (default 5 seconds)
+  → Confirm a start/end range and generate learning content
   → Play the selected range at 1× and continuously record tab audio
   → Upload numbered fragments with checksums and observed timing
   → Save each fragment and its manifest, then acknowledge receipt
   → Release each browser fragment after matching acknowledgement
   → Flush the final fragment and confirm the complete sequence
   → Verify and combine the continuous WebM recording
-  → Open private replay in an extension page
+  → Start studying, or open private audio replay under 调试信息
 ```
 
 Uploads are fragments of one recording container; do not decode each fragment independently.
 An interrupted upload retains acknowledged batches locally. Unacknowledged browser data is
 kept in the failed session until the user explicitly releases it; cross-browser-restart recovery
-is outside this stage. Raw batches and combined audio remain in `app/data/captures/` until deleted.
+is outside this stage. Confirmed batches and combined audio are kept under the local retention policy below.
 
-The first icon click prepares the tab audio stream so Chrome's short-lived stream permission
-can be consumed immediately. Recording starts only after you confirm the range. Cancel or
-close the panel to release it; the unconfirmed preparation expires after five minutes.
+The first icon click opens the panel. The tab audio stream is requested only after you confirm the range.
 
 Set `ENABLE_CAPTURE_TRANSCRIPTION=1` in the local backend configuration to enable Google windows as audio arrives. The extension announces this mode and displays transcription progress. The default is 0 for local capture only. Successful windows, request state and sentence JSON are private local artifacts; [transcription setup and recovery](TRANSCRIPTION.md) describes offline preparation, paid execution and explicit unknown-result retries. GPT processing remains separate.
 
@@ -68,8 +75,8 @@ In Chrome:
 1. Open `chrome://extensions` and enable Developer mode.
 2. Choose **Load unpacked** and select only `app/extension/`.
 3. Open a Japanese YouTube watch or Shorts page and click the extension icon.
-4. Set start/end time and the upload interval in the panel, then choose **开始采集**.
-5. Keep the tab open at normal speed. When all batches are confirmed, choose **打开私有录音回放**.
+4. Set start/end time in the panel, then choose **生成学习内容**.
+5. Keep the tab open at normal speed. When the recording is saved, study the ready sentences or choose **调试信息 → 打开私有录音回放** to check the recording.
 
 No microphone permission is required. The extension captures digital audio from the selected tab.
 
@@ -103,7 +110,9 @@ Keep keys out of chat messages, extension files, source code and Git. The extens
 
 Current results are saved under `app/data/captures/<capture-id>/`: recording batches, Google windows, ASR JSON, SQLite state and learning notes. They include source URLs and viewing/learning history. The entire directory is private local data ignored by Git. Legacy whole-file jobs remain under `app/data/<job-id>.json`.
 
-The extension creates a new capture ID for each selected range. Opening the panel can also load saved learning notes for the current video without recording. If several ranges exist, the current interface loads one saved task, preferring a task with ready notes; it does not combine all ranges or present a range library yet.
+The extension creates a new capture ID for each selected range. Recent clips lists each completed range with accepted learning notes separately, even when they come from the same video. Reviewing a saved clip or favorite does not record audio or start cloud processing.
+
+Favorites are stored independently in `app/data/learning_library/favorites.sqlite3`. Each holds the Japanese with readings, Chinese translation, complete analysis, and the source video and time when available. It remains readable after the original capture expires; listening again uses the original video.
 
 To prepare the new learning stage offline, run from `app/backend/`:
 
@@ -138,10 +147,11 @@ Replace `./video.mov` with the path to your own media. This CLI produces transcr
 | Uploaded local audio | Deleted when the normal job finishes, including handled success and failure; forced termination may leave files in `data/uploads/` |
 | Converted audio | Capture processing retains a local PCM cache for reuse; Google request windows are cut from it |
 | Transcript and context text | Sent to OpenAI only when learning-note generation is enabled or explicitly run via CLI; video frames are not sent |
-| Result JSON and source URLs | Retained locally until you delete them; no automatic retention limit |
+| Completed and interrupted captures | The backend checks at startup and hourly; captures expire seven days after the terminal recording manifest was saved. It skips recording, queued and active processing, as well as jobs whose safety cannot be confirmed. Cleanup includes that capture's recording, transcript and notes |
+| Favorite sentences | Saved independently until removed from favorites |
 | Google credentials / OpenAI key | Stay on the backend computer; not sent to the extension or included in repository files |
 
-There is no application-managed Google Cloud Storage bucket. Remote processing and retention are governed by your provider account and its settings. After stopping the service, you can remove unneeded result JSON and any abandoned upload files to reclaim space. Removing a result also removes the corresponding local cache.
+The seven-day policy applies to existing local captures as well as new ones. It does not clean legacy whole-file jobs or provider-side data. Remote processing and retention follow your provider account settings. After stopping the service, you can remove unneeded legacy result JSON or abandoned uploads to reclaim space.
 
 The local HTTP service is intended for one user's computer. It checks the loopback Host and allows extension origins or local clients without an Origin header before accessing saved data or starting work. This is not authentication against other programs or extensions on the same computer. Do not expose its port publicly or run it as a shared hosted service. Stop it when you have finished using the application.
 
@@ -162,6 +172,7 @@ From the repository root, run the extension's offline contract and lifecycle che
 node scripts/test_capture_extension.mjs
 node scripts/test_capture_page.mjs
 node scripts/test_capture_worker.mjs
+node scripts/test_review_panel.mjs
 ```
 
 These checks use synthetic media, a simulated DOM and mocked Chrome APIs; real-browser capture acceptance remains separate.
