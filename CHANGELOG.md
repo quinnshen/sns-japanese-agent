@@ -2,6 +2,13 @@
 
 This log summarizes committed development milestones. See the [application guide](app/README.md) for setup and usage, and the [roadmap](README.md#roadmap) for planned work.
 
+## 0.6.2 · 2026-11-05
+
+- Keep the study view synchronized with locally saved results after partial validation failures, including later transcription windows and independent text batches.
+- Release completed polling sessions so the final capture event can refresh the same clip. Status refreshes do not retry cloud requests.
+- Distinguish an unavailable or incompatible local backend from tab-audio connection errors, with actionable startup and restart guidance.
+- Document recovery from stale page UI after reloading the extension; refreshing the video page is still required.
+
 ## 0.6.0 · 2026-11-05
 
 - Introduce a clear prepare → study → next clip flow, with a separate review entry point.

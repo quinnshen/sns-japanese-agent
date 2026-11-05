@@ -1,5 +1,5 @@
 (() => {
-  const PAGE_VERSION = "0.6.0";
+  const PAGE_VERSION = "0.6.2";
   const PAGE_PROTOCOL = 1;
   const previous = window.__snsJapaneseAgentPage;
   if (previous) {
@@ -729,17 +729,16 @@
     const expectedSource = learningSourceIdentity;
     const epoch = learningEpoch;
     let disabledPolls = 0;
-    let attentionSnapshot = "";
-    let attentionObservations = 0;
     learningStatus.hidden = false;
     learningStatus.textContent = selectedFromReview ? "正在读取本机已保存的片段…" : "翻译和解析：等待完整句子就绪…";
     const current = () => !contextInvalidated && learningEpoch === epoch && identity() === expectedSource;
-    const schedule = () => { if (current()) learningTimer = setTimeout(() => { void poll(); }, 2500); };
+    const schedule = (delay = 2500) => { if (current()) learningTimer = setTimeout(() => { void poll(); }, delay); };
     const poll = async () => {
       if (!current()) return;
       if (learningInFlight) { schedule(); return; }
       learningInFlight = true;
       let terminal = false;
+      let nextPollDelay = 2500;
       try {
         const reply = await sendToWorker({ target: "worker", type: "capture-learning-status", captureId });
         if (!current()) return;
@@ -750,7 +749,6 @@
         if (takeComplete && !completedRange) completedRange = readRange(value.clip);
         const count = (item) => Number.isSafeInteger(item) && item >= 0 ? item : 0;
         const done = count(value.sentences_done), total = count(value.sentences_total);
-        if (value.status !== "needs_attention") { attentionSnapshot = ""; attentionObservations = 0; }
         const ready = Array.isArray(value.result?.sentences) ? value.result.sentences : [];
         const revision = JSON.stringify([learningCaptureId, value.revision, ready]);
         if (revision !== learningRevision && ready.length) {
@@ -765,15 +763,14 @@
           learningStatus.textContent = `${done} 句可学习。`;
           terminal = true;
         } else if (value.status === "needs_attention") {
-          learningStatus.textContent = `${done} 句可学习，${Math.max(0, total - done)} 句待处理。`;
-          terminal = true;
-          if ((enrichmentEnabled || selectedFromReview) && count(value.batches_done) + count(value.blocked_batches) < count(value.batches_total)) {
-            const snapshot = JSON.stringify([value.revision, done, total, count(value.batches_done), count(value.batches_total), count(value.blocked_batches)]);
-            attentionObservations = snapshot === attentionSnapshot ? attentionObservations + 1 : 1;
-            attentionSnapshot = snapshot;
-            terminal = attentionObservations >= 2;
-            if (!terminal) learningStatus.textContent += " 其余批次尚未完成，正在确认进度。";
-          }
+          const missing = Math.max(0, total - done);
+          const invalid = Math.min(missing, count(value.invalid_sentences));
+          learningStatus.textContent = `${done} 句可学习${invalid ? `，${invalid} 句需检查` : ""}${missing > invalid ? `，${missing - invalid} 句尚未就绪` : ""}。有批次需检查；不会自动重试失败或结果未知的请求；正在同步已保存内容。`;
+          // A blocked batch does not mean the source is final: later ASR windows
+          // and independent batches can still publish notes. Only read cached
+          // status here; never start or retry a paid request.
+          terminal = !enrichmentEnabled && !selectedFromReview;
+          nextPollDelay = 10_000;
         } else if (["error", "paused", "disabled", "request_budget_reached"].includes(value.status)) {
           learningStatus.textContent = `翻译和解析需检查：已完成 ${done}/${total} 句；已有内容可继续学习。不会自动重试未知或失败请求。`;
           terminal = true;
@@ -797,7 +794,8 @@
         learningInFlight = false;
         if (current()) {
           updateStudyActions();
-          if (!terminal) schedule();
+          if (terminal) stopLearningPolling();
+          else schedule(nextPollDelay);
         }
       }
     };

@@ -1,6 +1,6 @@
 const SESSION_KEY = "activeCapture";
 const API = "http://127.0.0.1:8766";
-const PAGE_VERSION = "0.6.0";
+const PAGE_VERSION = "0.6.2";
 const PAGE_PROTOCOL = 1;
 let creatingOffscreen;
 let opening = false;
@@ -10,6 +10,33 @@ const reviewRestoring = new Map();
 const REARM_BUSY = "正在连接音频，请稍候后重试。";
 const REARM_ACTIVE = "已有采集任务，请先中断／释放音频后重试。";
 const REARM_FALLBACK = "音频未连接，请点击浏览器工具栏 S，再点击生成学习内容。";
+const BACKEND_ERRORS = Object.freeze({
+  backend_unavailable: "无法连接本机服务。请先启动本机后端，确认 127.0.0.1:8766 可用后，再点击生成学习内容。",
+  backend_incompatible: "本机服务响应不兼容。请更新并重启支持分批采集的本机后端，再点击生成学习内容。",
+});
+
+function backendFailure(code) {
+  return Object.assign(new Error(BACKEND_ERRORS[code]), { code });
+}
+
+async function readBackendHealth() {
+  const controller = new AbortController();
+  const request = (async () => {
+    let response;
+    try { response = await fetch(`${API}/health`, { signal: controller.signal }); }
+    catch (_) { throw backendFailure("backend_unavailable"); }
+    if (!response?.ok) throw backendFailure("backend_unavailable");
+    let health;
+    try { health = await response.json(); }
+    catch (_) { throw backendFailure("backend_incompatible"); }
+    if (!health || typeof health !== "object" || Array.isArray(health) || health.capabilities?.capture_batches !== true) {
+      throw backendFailure("backend_incompatible");
+    }
+    return health;
+  })();
+  try { return await within(request, 5000, backendFailure("backend_unavailable")); }
+  finally { controller.abort(); }
+}
 
 async function within(promise, milliseconds, message) {
   let timer;
@@ -235,15 +262,7 @@ async function openAgent(tab, { freshOnly = false, rearmRequestId } = {}) {
       return { ok: true, idle: true };
     }
     await notify(tab.id, "正在连接本机采集服务…");
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
-    let health;
-    try {
-      const response = await fetch(`${API}/health`, { signal: controller.signal });
-      if (!response.ok) throw new Error("本机服务不可用");
-      health = await response.json();
-    } finally { clearTimeout(timeout); }
-    if (!health.capabilities?.capture_batches) throw new Error("请启动支持分批采集的新版本本机后端。");
+    const health = await readBackendHealth();
     session = { tabId: tab.id, sessionId: crypto.randomUUID(), sourceUrl: tab.url, phase: "preparing",
       transcriptionEnabled: health.capabilities?.capture_transcription === true,
       enrichmentEnabled: health.capabilities?.capture_enrichment === true && health.capabilities?.capture_transcription === true };
@@ -282,13 +301,14 @@ async function openAgent(tab, { freshOnly = false, rearmRequestId } = {}) {
       : "选择采集范围和上传间隔，再点击开始。尚未录音，不调用云端服务。");
     return { ok: true, sessionId: session.sessionId };
   } catch (error) {
-    const failure = freshOnly ? REARM_FALLBACK : `准备失败：${error.message}`;
+    const backendMessage = Object.prototype.hasOwnProperty.call(BACKEND_ERRORS, error?.code) ? BACKEND_ERRORS[error.code] : null;
+    const failure = backendMessage || (freshOnly ? REARM_FALLBACK : `准备失败：${error.message}`);
     if (tab.id) await notify(tab.id, failure, true).catch(() => {});
     if (session) {
       await within(offscreenMessage({ type: "capture-abort", sessionId: session.sessionId }), 3000, "音频准备取消超时").catch(() => {});
       await finish(session);
     }
-    return { ok: false, error: freshOnly ? REARM_FALLBACK : failure };
+    return { ok: false, error: failure };
   } finally { opening = false; }
 }
 

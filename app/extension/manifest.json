@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "SNS Japanese Agent",
-  "version": "0.6.0",
+  "version": "0.6.2",
   "description": "Study Japanese YouTube clips, review recent segments, and save favorite sentences locally.",
   "minimum_chrome_version": "116",
   "permissions": [

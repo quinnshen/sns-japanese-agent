@@ -624,9 +624,9 @@ for (const mode of ["sync", "async"]) {
   const h = await recording();
   const handshake = await h.dispatch("page-handshake");
   assert.equal(handshake.ok, true);
-  assert.equal(handshake.version, "0.6.0");
+  assert.equal(handshake.version, "0.6.2");
   assert.equal(handshake.protocol, 1);
-  assert.equal(h.panelVersion, "v0.6.0");
+  assert.equal(h.panelVersion, "v0.6.2");
   assert.equal(h.injectionResult.version, handshake.version);
   assert.equal(h.reinject().version, handshake.version);
   assert.equal(h.panelCount, 1);
@@ -664,7 +664,7 @@ for (const mode of ["sync", "async"]) {
   const h = harness({ duration: 120, foreignPanel: true });
   assert.equal(h.injectionResult.ok, true);
   assert.equal((await h.configure()).ok, true);
-  assert.equal((await h.dispatch("page-handshake")).version, "0.6.0");
+  assert.equal((await h.dispatch("page-handshake")).version, "0.6.2");
   assert.equal(h.panelCount, 1);
   assert.equal(h.foreignPanelConnected, true, "The new extension must not remove another installation's panel");
   assert.equal(h.begin.disabled, false);
@@ -822,8 +822,8 @@ console.log("PASS cancellation and closure ignore late learning responses and st
     learningReplies: [learningValue({ status: "running", revision: 2, total: 2 }),
       learningValue({ revision: 3, items: [studySentence(), studySentence({ id: "s002", start: 4, end: 6 })] })] });
   await h.configure(); await h.openSaved(); await flush();
-  assert.match(h.learning.textContent, /正在确认进度/);
-  await h.advance(2500);
+  assert.match(h.learning.textContent, /正在同步已保存内容/);
+  await h.advance(10_000);
   assert.equal(h.learningCalls, 1);
   await h.advance(2500);
   assert.equal(h.learningCalls, 2);
@@ -834,15 +834,85 @@ console.log("PASS cancellation and closure ignore late learning responses and st
   console.log("PASS a transient partial-batch warning keeps polling independent work until later notes complete");
 }
 {
-  const attention = { ...learningValue({ status: "needs_attention", total: 2 }), batches_done: 0, batches_total: 2, blocked_batches: 1 };
-  const h = harness({ duration: 120, enrichmentEnabled: true, learningLoadReply: attention, learningReplies: [attention] });
+  const items = (count) => Array.from({ length: count }, (_, index) => studySentence({
+    id: `s${String(index + 1).padStart(3, "0")}`, start: index * 2, end: index * 2 + 1,
+  }));
+  const attention = { ...learningValue({ status: "needs_attention", total: 13, items: items(5) }),
+    batches_done: 0, batches_total: 2, blocked_batches: 2, invalid_sentences: 1 };
+  const later = { ...learningValue({ status: "needs_attention", revision: 2, total: 69, items: items(54) }),
+    batches_done: 3, batches_total: 12, blocked_batches: 9, invalid_sentences: 15 };
+  const h = harness({ duration: 120, enrichmentEnabled: true, learningLoadReply: attention,
+    learningReplies: [...Array(4).fill(attention), later] });
   await h.configure(); await h.openSaved(); await flush();
-  await h.advance(2500);
+  assert.equal(h.list.children.length, 5);
+  assert.match(h.learning.textContent, /5 句可学习，1 句需检查，7 句尚未就绪/);
+  assert.match(h.learning.textContent, /不会自动重试失败或结果未知的请求/);
+  h.list.children[0].children[1].click();
+  h.list.scrollTop = 123;
+  h.load.click(); await flush();
+  const panel = h.list.parentElement;
+  const review = panel.children.find((element) => element.className === "sns-review");
+  const reviewText = allText(review);
+  assert.equal(panel.dataset.view, "review");
+  await h.advance(40_000);
+  assert.equal(h.learningCalls, 4, "Repeated unchanged partial results must not hide later ASR windows and saved notes");
+  assert.equal(h.list.children.length, 5);
+  await h.advance(10_000);
+  assert.equal(h.learningCalls, 5);
+  assert.equal(h.list.children.length, 54);
+  assert.match(h.learning.textContent, /54 句可学习，15 句需检查/);
+  assert.match(h.learning.textContent, /15 句未通过校验/);
+  assert.equal(panel.dataset.view, "review", "A late saved result must not pull the learner out of review");
+  assert.equal(review.hidden, false);
+  assert.equal(h.list.hidden, true);
+  assert.equal(allText(review), reviewText, "Updating the hidden study list must not replace the review contents");
+  h.load.click(); await flush();
+  assert.equal(panel.dataset.view, "study");
+  assert.equal(h.list.hidden, false);
+  assert.equal(h.list.children[0].children[2].hidden, false, "Saved revisions preserve expanded explanations");
+  assert.equal(h.list.scrollTop, 123);
+  assert.equal(h.playCalls, 0, "Synchronizing cached results must not start playback");
+  assert.ok(h.messages.every((message) => ["capture-learning-status", "review-library"].includes(message.type)),
+    "Background synchronization may only read cached learning and review data");
+  h.close.click(); await flush();
+  await h.advance(30_000);
+  assert.equal(h.learningCalls, 5, "Closing the panel stops slow cached-result polling");
+  console.log("PASS unchanged partial results keep slow read-only synchronization as source grows from 13 to 69 sentences, without disrupting review");
+}
+{
+  const attention = { ...learningValue({ status: "needs_attention", total: 2 }), invalid_sentences: 1 };
+  const h = harness({ duration: 120, learningLoadReply: attention, learningReplies: Array(20).fill(attention) });
+  await h.configure(); await h.openSaved(); await flush();
+  await h.advance(120_000);
+  assert.equal(h.learningLoadCalls + h.learningCalls, 12, "Disabled enrichment keeps a bounded cached-result polling limit");
+  assert.match(h.learning.textContent, /稍后可在复习中重新打开此片段/);
+  const requests = h.learningCalls;
+  await h.advance(30_000);
+  assert.equal(h.learningCalls, requests);
+  console.log("PASS disabled enrichment retains its bounded read-only polling limit for partial cached results");
+}
+{
+  const h = await recording({ enrichmentEnabled: true, learningReplies: [
+    learningValue({ captureId: sessionId, status: "complete" }),
+    learningValue({ captureId: sessionId, revision: 2, items: [studySentence(), studySentence({ id: "s002", start: 4, end: 6 })] }),
+  ] });
   assert.equal(h.learningCalls, 1);
-  await h.advance(10000);
-  assert.equal(h.learningCalls, 1, "Two identical needs-attention observations must stop polling within a bounded grace period");
-  assert.match(h.learning.textContent, /待处理/);
-  console.log("PASS a persistently unchanged partial-batch warning stops after two matching observations");
+  await h.advance(10_000);
+  assert.equal(h.learningCalls, 1, "An actual terminal result stops its status timer");
+  const requests = h.messages.length;
+  await h.dispatch("capture-saved", { enrichmentEnabled: true, manifest: {
+    id: sessionId, audio_url: `/captures/${sessionId}/audio`, expected_batches: 1, audio_size_bytes: 1000,
+    range_start_sec: 0, range_end_sec: 20,
+  } });
+  await flush();
+  assert.equal(h.learningCalls, 2, "Final capture publication can refresh a previously terminal poll of the same capture");
+  assert.equal(h.list.children.length, 2);
+  assert.ok(h.messages.slice(requests).every((message) => message.type === "capture-learning-status"),
+    "Final publication only reads saved notes, without recording or paid processing");
+  await h.advance(10_000);
+  assert.equal(h.learningCalls, 2);
+  await h.dispatch("capture-stop-playback");
+  console.log("PASS a terminal learning poll releases its binding so final same-capture publication can read newer saved results");
 }
 {
   const h = harness({ duration: 120 });
@@ -1200,4 +1270,4 @@ console.log("PASS cancellation and closure ignore late learning responses and st
   assert.deepEqual(h.messages, []);
   console.log("PASS long-video idle defaults to current position and asks for an endpoint before audio preparation");
 }
-console.log("63 offline page lifecycle, layout, and learning checks passed.");
+console.log("65 offline page lifecycle, layout, and learning checks passed.");

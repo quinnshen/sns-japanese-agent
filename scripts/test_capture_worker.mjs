@@ -8,7 +8,7 @@ const extensionId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const origin = `chrome-extension://${extensionId}/`;
 const videoUrl = "https://www.youtube.com/watch?v=AbCdEf012_-";
 const tab = { id: 7, url: videoUrl, active: true };
-const pageMetadata = { ok: true, version: "0.6.0", protocol: 1 };
+const pageMetadata = { ok: true, version: "0.6.2", protocol: 1 };
 const tick = async () => { for (let i = 0; i < 120; i++) await Promise.resolve(); };
 async function until(check) { for (let i = 0; i < 20; i++) { if (check()) return; await tick(); } assert.ok(check(), "Lifecycle did not reach expected state"); }
 function deferred() { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; }
@@ -25,7 +25,7 @@ function workerHarness({ initial, documentExists = false, inspect = { ok: true, 
   handshakeReply = pageMetadata, statusUnavailable = false, enrichmentEnabled = false,
   learningReply = {}, latestLearningReply = learningReply, currentTabUrl = videoUrl,
   currentTabActive = true, currentTabId = tab.id, closeDocument, configuringReply = { ok: true }, prepareReply,
-  libraryReply = {}, favoriteReply = { saved: true }, reviewStatus = 200, failUpdate = false } = {}) {
+  libraryReply = {}, favoriteReply = { saved: true }, reviewStatus = 200, failUpdate = false, healthResponse } = {}) {
   const timer = clock(); let action; let listener; let updated; let removed; let stored = initial; let contexts = documentExists;
   const pending = new Map(); const navigations = [];
   let pageSessionId;
@@ -95,6 +95,7 @@ function workerHarness({ initial, documentExists = false, inspect = { ok: true, 
       lifecycle.push("fetch"); fetches.push(url);
       fetchOptions.push(structuredClone({ method: options?.method || "GET", credentials: options?.credentials,
         ...(options?.body ? { body: JSON.parse(options.body) } : {}) }));
+      if (new URL(url).pathname === "/health" && healthResponse) return healthResponse(options);
       if (["/learning/library", "/learning/favorites"].includes(new URL(url).pathname) && reviewStatus !== 200) {
         return { ok: false, status: reviewStatus, json: async () => ({ error: "synthetic-private-error" }) };
       }
@@ -122,6 +123,73 @@ function workerHarness({ initial, documentExists = false, inspect = { ok: true, 
     get createCount() { return createCount; }, get contextCalls() { return contextCalls; },
     message,
   };
+}
+{
+  const healthy = () => ({ ok: true, json: async () => ({ capabilities: { capture_batches: true } }) });
+  const cases = [
+    ["connection", () => { throw new Error("synthetic-private-marker: connection refused"); }, /请先启动本机后端/],
+    ["HTTP failure", () => ({ ok: false, status: 503, json: async () => { throw new Error("Failed health responses must not be read"); } }), /请先启动本机后端/],
+    ["invalid JSON", () => ({ ok: true, json: async () => { throw new Error("synthetic-private-marker: malformed response"); } }), /请更新并重启/],
+    ["null body", () => ({ ok: true, json: async () => null }), /请更新并重启/],
+    ["missing capability", () => ({ ok: true, json: async () => ({ capabilities: { capture_batches: false } }) }), /请更新并重启/],
+  ];
+  for (const [name, failure, expected] of cases) {
+    let unavailable = true;
+    const h = workerHarness({ healthResponse: () => unavailable ? failure() : healthy() });
+    const reply = await h.arm();
+    assert.equal(reply.ok, false, name);
+    assert.match(reply.error, expected, name);
+    if (name === "connection") assert.match(reply.error, /127\.0\.0\.1:8766/);
+    assert.equal(h.badges.at(-1).text, "ERR", name);
+    assert.equal(h.titles.at(-1).title, reply.error, name);
+    assert.equal(JSON.stringify([reply, h.pageMessages, h.titles]).includes("synthetic-private-marker"), false, name);
+    assert.equal(h.stored, undefined, name);
+    assert.equal(h.streamCalls, 0, name);
+    assert.equal(h.createCount, 0, name);
+    assert.equal(h.offscreenMessages.length, 0, name);
+    assert.equal(h.pageMessages.some((message) => ["capture-configuring", "prepare", "play"].includes(message.type)), false, name);
+    assert.equal(h.fetches.length, 1, "Failed health checks must not retry automatically");
+    unavailable = false;
+    assert.equal((await h.arm()).ok, true, "An explicit retry can recover after the backend starts or updates");
+    assert.equal(h.stored.phase, "ready", name);
+    assert.equal(h.streamCalls, 1, name);
+    assert.equal(h.createCount, 1, name);
+    assert.equal(h.badges.at(-1).text, "JA", name);
+  }
+  console.log("PASS failed or incompatible backend health checks give fixed actionable diagnostics before audio setup and recover on explicit retry");
+}
+{
+  for (const stalledStage of ["response", "body"]) {
+    const pending = deferred();
+    const health = { capabilities: { capture_batches: true } };
+    let stalled = true;
+    let signal;
+    const h = workerHarness({ healthResponse: (options) => {
+      signal = options.signal;
+      if (!stalled) return { ok: true, json: async () => health };
+      return stalledStage === "response" ? pending.promise : { ok: true, json: () => pending.promise };
+    } });
+    const first = h.arm();
+    await until(() => h.fetches.length === 1);
+    h.timer.fire(5000);
+    const reply = await first;
+    assert.equal(reply.ok, false);
+    assert.match(reply.error, /请先启动本机后端/);
+    assert.equal(signal.aborted, true, "The health request is aborted after its deadline");
+    assert.equal(h.stored, undefined);
+    assert.equal(h.streamCalls, 0);
+    assert.equal(h.createCount, 0);
+    assert.equal(h.offscreenMessages.length, 0);
+    stalled = false;
+    pending.resolve(stalledStage === "response" ? { ok: true, json: async () => health } : health);
+    await tick();
+    assert.equal(h.stored, undefined, "Late health responses cannot start an expired preparation");
+    assert.equal(h.streamCalls, 0);
+    assert.equal(h.fetches.length, 1);
+    assert.equal((await h.arm()).ok, true);
+    assert.equal(h.streamCalls, 1);
+  }
+  console.log("PASS backend health deadlines cover response and body, abort without audio setup, and ignore late results");
 }
 {
   const h = workerHarness({ streamId: (attempt) => attempt === 1 ? new Promise(() => {}) : "retry-stream", stallAbort: true });
@@ -966,4 +1034,4 @@ console.log("PASS pre-roll and mid-capture ad interruption retain a bounded code
   assert.equal(h.streamCalls, 0);
   console.log("PASS missing review APIs explain backend restart while a real empty library remains a successful empty result");
 }
-console.log("48 preparation, recovery, review, learning, status, and failure lifecycle checks passed.");
+console.log("50 preparation, recovery, review, learning, status, and failure lifecycle checks passed.");

@@ -70,6 +70,6 @@ The application is developed under `app/`. The original five-second test remains
 
 ## Version history
 
-Current development version: **0.6.0**, with separate study and review paths, saved sentences, and automatic cleanup of regular clips.
+Current development version: **0.6.2**, with updated study results during background processing and clearer local-backend connection errors. Version 0.6.0 introduced separate study and review paths, saved sentences, and automatic cleanup of regular clips.
 
 See [CHANGELOG](CHANGELOG.md) for the development history.

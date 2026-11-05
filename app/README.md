@@ -115,7 +115,7 @@ Retrying creates a new recording task for the original range and may incur new t
 
 ASR transcripts may contain recognition errors, omitted speech, or incorrect sentence boundaries. The original ASR is stored separately; displayed Japanese may add kana readings but must not silently rewrite the source sentence.
 
-You can study neighboring sentences that passed validation. Incomplete or invalid sentences remain pending; failed requests and requests with unknown outcomes are not automatically resent. Use [targeted retries with a request limit](LEARNING.md#恢复重试与请求限制) when repairs are needed (technical guide in Chinese).
+You can study neighboring sentences that passed validation. The study view continues reading saved results as other batches finish, even when some sentences fail validation. These local status checks do not call cloud providers or retry failures. Sentences that failed validation need attention; waiting alone does not retry them. Use [targeted retries with a request limit](LEARNING.md#恢复重试与请求限制) when repairs are needed (technical guide in Chinese).
 
 ### Recent clips and saved sentences
 
@@ -148,6 +148,12 @@ The data directory contains source links, recordings, and learning history and i
 The service is intended for a personal computer. Loopback Host and Origin checks restrict access but do not authenticate other programs on the same machine. Do not expose the port publicly or use it as a shared hosted service.
 
 ## Troubleshooting
+
+**The extension badge says ERR**
+
+Hover over the badge to read the error. If it includes `orphan_root`, the page still contains UI from an invalidated extension context. Refresh the **video page itself**, then click S again. Reloading only the extension does not clear the old page UI.
+
+If the message says the local backend is unavailable, start the service described above and try generating again. Reopening Chrome does not start the Python backend. If it says the backend is incompatible, restart it using the current backend code. No recording begins while this service check fails.
 
 **Saving fails, or review cannot load**
 
