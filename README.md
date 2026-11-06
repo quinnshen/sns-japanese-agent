@@ -35,10 +35,16 @@ Video page support is being expanded. See the guide for currently supported page
 
 ## Roadmap
 
-- **Video understanding:** use on-screen text, actions, and scenes to clarify details left out of the audio, including references such as “this” and “here.”
-- **Curated grammar learning:** select useful patterns and expressions from dialogue, explaining their structure, use, and tone in context, with less repetition.
-- **More SNS video pages:** support more video pages in Chrome so learners can follow their own interests.
-- **Long-video reliability:** improve handling of ads, buffering, task recovery, and progress reporting, then validate longer study sessions.
+| Priority | Planned work |
+|---|---|
+| **1. Understand short videos with visual context** | Combine sampled frames with ASR to interpret on-screen text, visual effects, gestures, and scenes. Use that context to improve translations and explanations while preserving the original transcript and marking uncertainty. Build a varied evaluation set and compare results with audio-only processing. |
+| **2. Use visual context selectively in long videos** | After validating the short-video approach, let the agent decide which segments need visual input. Extend the pipeline with reusable visual-processing stages, cached results, and frame/request limits. Test whether selective processing improves understanding without unnecessary cost. |
+| **3. Strengthen reliability and recovery** | Improve handling of ads, buffering, tab changes, backend disconnects, cancellation, and restarts. Refactor task state transitions, add offline regression and recovery tests, validate 30–40-minute captures, and document recovery steps. |
+| **4. Evaluate more models to reduce cost** | Extend provider adapters and configuration to support more candidate models. Compare Japanese accuracy, kana readings, explanation quality, validation pass rate, latency, and cost. Add repeatable evaluation scripts and document measured tradeoffs and setup. |
+
+The short-video experiment is the starting point for adaptive long-video understanding. Reliability work and model evaluation can progress alongside it.
+
+Further directions include **curated grammar learning**—selecting useful patterns and expressions from dialogue—and support for **more SNS video pages** in Chrome.
 
 These are planned improvements. The usage guide describes what is available today.
 
