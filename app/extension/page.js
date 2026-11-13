@@ -1,5 +1,5 @@
 (() => {
-  const PAGE_VERSION = "0.6.2";
+  const PAGE_VERSION = "0.6.4";
   const PAGE_PROTOCOL = 1;
   const previous = window.__snsJapaneseAgentPage;
   if (previous) {
@@ -394,7 +394,7 @@
     setInputsDisabled(true);
     showStatus("正在准备所选片段…");
     try {
-      const reply = await sendToWorker({ target: "worker", type: "capture-rearm", requestId: epoch });
+      const reply = await sendToWorker({ target: "worker", type: "capture-rearm", requestId: epoch, sourceUrl: location.href });
       if (contextInvalidated || epoch !== reconnectEpoch || panelDismissed) return false;
       if (!reply?.ok) throw new Error(reply?.error || "音频未重新连接，请点击浏览器工具栏 S 重新连接音频。");
       if (!configured || sessionId !== reply.sessionId) throw new Error("音频尚未就绪，请点击浏览器工具栏 S 重新连接音频。");
@@ -806,7 +806,9 @@
     // Choose the actual player, never whichever preview currently occupies the largest area.
     if (location.pathname?.startsWith("/shorts/") || new URL(location.href).pathname.startsWith("/shorts/")) {
       const active = document.querySelector("ytd-reel-video-renderer[is-active]");
-      if (active) return mainVideoWithin(active);
+      // Shorts may use one shared player outside the active renderer. A retained
+      // watch-page player can still exist in the DOM, so do not fall back to it.
+      return mainVideoWithin(active) || mainVideoWithin(document.querySelector("#shorts-player"));
     }
     const main = document.querySelector("#movie_player") || document.querySelector("ytd-watch-flexy #player");
     return mainVideoWithin(main) || document.querySelector("video.html5-main-video") || document.querySelector("video");
@@ -849,7 +851,8 @@
   }
 
   function validateRange(start, end, duration) {
-    if (!Number.isFinite(duration) || duration <= 0) throw new Error("请先加载一个非直播视频。");
+    if (duration === Infinity) throw new Error("暂不支持直播，请选择已结束的视频。");
+    if (!Number.isFinite(duration) || duration <= 0) throw new Error("视频信息尚未加载完成，请等视频可正常播放后重试。");
     if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end - start < 1 || end > duration) throw new Error("请选择视频时长内有效的起止时间。");
     if (end - start > 1800) throw new Error("本阶段每次采集范围不超过 30 分钟；长视频可以选择其中一段。");
   }

@@ -167,6 +167,14 @@ Check whether cloud processing is enabled and whether the panel reports pending 
 
 Confirm that the video itself plays and ads have finished, then retry. Pausing and seeking freely during recording are not supported yet. Long-video recovery and reliability remain on the roadmap.
 
+**A Short is reported as live, or its duration is missing**
+
+Reload the current extension build and refresh the video page. Shorts use their own player, which must be selected separately from any retained watch-page player. If metadata is still loading, let the video load and then retry generation. Live streams are not supported.
+
+**Audio fails to connect after switching videos**
+
+Audio connection failures include a fixed stage such as `[source_changed]`, `[tab_audio]`, or `[media_connect]`. Follow the message for that stage. These diagnostics identify where preparation stopped without displaying raw browser errors, audio stream identifiers, or account details. After changing videos within the same tab, generation checks the selected URL against Chrome’s current tab before connecting audio.
+
 ## Development and diagnostics
 
 - [Transcription, time mapping, and recovery](TRANSCRIPTION.md) (Chinese)

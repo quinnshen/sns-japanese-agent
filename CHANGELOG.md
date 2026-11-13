@@ -2,6 +2,14 @@
 
 This log summarizes committed development milestones. See the [application guide](app/README.md) for setup and usage, and the [roadmap](README.md#roadmap) for planned work.
 
+## 0.6.4 · 2026-11-13
+
+- Select the current Shorts player when a hidden watch-page player remains in the page, including Shorts layouts without an active-renderer attribute.
+- Distinguish missing video metadata from a live stream, and allow an explicit retry after the video finishes loading.
+- Bind audio reconnection to the selected page URL and Chrome’s current tab snapshot, rather than a potentially stale sending-document URL after in-page navigation.
+- Report fixed audio preparation stages without exposing raw browser errors or stream identifiers.
+- Add regression coverage for Shorts, retained players, and audio arm/release across navigation between short and long videos.
+
 ## 0.6.2 · 2026-11-05
 
 - Keep the study view synchronized with locally saved results after partial validation failures, including later transcription windows and independent text batches.

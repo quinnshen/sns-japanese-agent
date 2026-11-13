@@ -86,7 +86,8 @@ class FakeElement {
   getBoundingClientRect() { return { top: 0, left: 0, right: 640, bottom: 360 }; }
 }
 
-function harness({ duration = NaN, pendingPlay = false, failBegin = false, shorts = false, transcriptionEnabled = false, statusReplies = [], foreignPanel = false,
+function harness({ duration = NaN, pendingPlay = false, failBegin = false, shorts = false, shortsLayout = "legacy", watchDuration = NaN,
+  transcriptionEnabled = false, statusReplies = [], foreignPanel = false,
   enrichmentEnabled = false, learningReplies = [], learningLoadReply = { capture_id: null, status: "not_found", result: null },
   cancelReply, libraryReply = { ok: true, clips: [], favorites: [] },
   rearmReply = { ok: false, error: "音频未重新连接，请点击浏览器工具栏 S 重新连接音频。" } } = {}) {
@@ -117,11 +118,29 @@ function harness({ duration = NaN, pendingPlay = false, failBegin = false, short
   };
   video.classList.add("html5-main-video");
   let player = new FakeElement("div");
-  player.id = "movie_player";
+  const sharedShorts = shortsLayout !== "legacy";
+  player.id = sharedShorts ? "shorts-player" : "movie_player";
   player.classList.add("html5-video-player");
   player.append(video);
   const activeShorts = new FakeElement("ytd-reel-video-renderer");
-  if (shorts) activeShorts.append(player);
+  if (shorts && !sharedShorts) activeShorts.append(player);
+  const retainedWatch = sharedShorts ? new FakeElement("div") : null;
+  let watchVideo;
+  let shortsPlayerPresent = true;
+  if (retainedWatch) {
+    retainedWatch.id = "movie_player";
+    retainedWatch.classList.add("html5-video-player");
+    watchVideo = new FakeElement("video");
+    watchVideo.classList.add("html5-main-video");
+    Object.assign(watchVideo, {
+      duration: watchDuration, currentTime: 0, paused: true, ended: false, seeking: false, loop: false,
+      playbackRate: 1, readyState: Number.isFinite(watchDuration) ? 4 : 0, networkState: 2, error: null,
+    });
+    watchVideo.getBoundingClientRect = () => ({ top: 0, left: 0, right: 0, bottom: 0 });
+    watchVideo.pause = () => { watchVideo.paused = true; };
+    watchVideo.play = () => { watchVideo.paused = false; watchVideo.emit("playing"); return Promise.resolve(); };
+    retainedWatch.append(watchVideo);
+  }
   const unrelatedPlayer = new FakeElement("div");
   unrelatedPlayer.classList.add("html5-video-player");
   const previews = [];
@@ -130,16 +149,18 @@ function harness({ duration = NaN, pendingPlay = false, failBegin = false, short
     createElement: (name) => new FakeElement(name),
     getElementById(id) { return this.documentElement.querySelector(`#${id}`); },
     querySelector(selector) {
-      if (selector === "ytd-reel-video-renderer[is-active]") return shorts ? activeShorts : null;
-      if (selector === "#movie_player") return player;
+      if (selector === "ytd-reel-video-renderer[is-active]") return shorts && shortsLayout !== "shared" ? activeShorts : null;
+      if (selector === "#shorts-player") return sharedShorts && shortsPlayerPresent ? player : null;
+      if (selector === "#movie_player") return retainedWatch || player;
       if (selector === ".html5-video-player.ad-showing") return unrelatedPlayer.classList.contains("ad-showing") ? unrelatedPlayer : null;
-      if (selector === "video.html5-main-video") return player.querySelector(selector);
-      if (selector === "video") return previews[0] || player.querySelector(selector);
+      if (selector === "video.html5-main-video") return watchVideo || player.querySelector(selector);
+      if (selector === "video") return previews[0] || watchVideo || player.querySelector(selector);
       return null;
     },
-    querySelectorAll: (selector) => selector === "video" ? [...previews, ...player.children] : [],
+    querySelectorAll: (selector) => selector === "video" ? [...previews, ...(retainedWatch?.children || []), ...player.children] : [],
   };
-  document.documentElement.append(shorts ? activeShorts : player, unrelatedPlayer);
+  if (retainedWatch) document.documentElement.append(retainedWatch, activeShorts, player, unrelatedPlayer);
+  else document.documentElement.append(shorts ? activeShorts : player, unrelatedPlayer);
   let foreignRoot;
   if (foreignPanel) {
     foreignRoot = new FakeElement("div");
@@ -262,7 +283,8 @@ function harness({ duration = NaN, pendingPlay = false, failBegin = false, short
       if (clearId) runtime.id = undefined;
       runtimeFailure = { mode, type };
     },
-    get player() { return player; }, unrelatedPlayer, previews,
+    get player() { return player; }, unrelatedPlayer, previews, watchVideo,
+    setShortsPlayerPresent(value) { shortsPlayerPresent = value; },
     replacePlayer(replacement) { player = replacement; },
     releasePlay: () => releasePlay?.(),
     async configure() {
@@ -270,6 +292,15 @@ function harness({ duration = NaN, pendingPlay = false, failBegin = false, short
       return dispatch("capture-configure", { transcriptionEnabled, enrichmentEnabled });
     },
   };
+}
+
+function generationHarness(options) {
+  let h;
+  h = harness({ ...options, rearmReply: async () => {
+    const configured = await h.configure();
+    return { ...configured, sessionId };
+  } });
+  return h;
 }
 
 {
@@ -624,9 +655,9 @@ for (const mode of ["sync", "async"]) {
   const h = await recording();
   const handshake = await h.dispatch("page-handshake");
   assert.equal(handshake.ok, true);
-  assert.equal(handshake.version, "0.6.2");
+  assert.equal(handshake.version, "0.6.4");
   assert.equal(handshake.protocol, 1);
-  assert.equal(h.panelVersion, "v0.6.2");
+  assert.equal(h.panelVersion, "v0.6.4");
   assert.equal(h.injectionResult.version, handshake.version);
   assert.equal(h.reinject().version, handshake.version);
   assert.equal(h.panelCount, 1);
@@ -664,7 +695,7 @@ for (const mode of ["sync", "async"]) {
   const h = harness({ duration: 120, foreignPanel: true });
   assert.equal(h.injectionResult.ok, true);
   assert.equal((await h.configure()).ok, true);
-  assert.equal((await h.dispatch("page-handshake")).version, "0.6.2");
+  assert.equal((await h.dispatch("page-handshake")).version, "0.6.4");
   assert.equal(h.panelCount, 1);
   assert.equal(h.foreignPanelConnected, true, "The new extension must not remove another installation's panel");
   assert.equal(h.begin.disabled, false);
@@ -1214,6 +1245,118 @@ console.log("PASS cancellation and closure ignore late learning responses and st
   console.log("PASS idle, explicit review, and next-segment actions do not start recording or change playback");
 }
 {
+  for (const shortsLayout of ["legacy", "shared", "empty-active-shared"]) {
+    const h = generationHarness({ shorts: true, shortsLayout, duration: 55 });
+    h.video.currentTime = 27;
+    h.video.loop = true;
+    await h.dispatch("capture-idle");
+    assert.deepEqual(h.inputs.slice(0, 2).map(input => input.value), ["0:00", "55"], shortsLayout);
+    assert.deepEqual(h.messages, [], "Opening the Shorts form must not prepare audio");
+    h.begin.click(); await flush(); await flush();
+    assert.deepEqual(h.messages.map(message => message.type), ["capture-rearm", "capture-begin"], shortsLayout);
+    const request = h.messages.at(-1);
+    assert.equal(request.rangeStart, 0);
+    assert.equal(request.rangeEnd, 55);
+    assert.equal(h.watchVideo?.paused ?? true, true);
+    h.video.currentTime = 0;
+    assert.equal((await h.dispatch("prepare", { rangeStart: 0, rangeEnd: 55, batchIntervalMs: 5000 })).ok, true);
+    assert.equal((await h.dispatch("play")).ok, true);
+    assert.equal(h.video.paused, false);
+    assert.equal(h.video.loop, false, "A looping Short records one selected pass");
+    h.video.currentTime = 55;
+    h.video.emit("timeupdate"); await flush();
+    const ended = h.messages.filter(message => message.type === "page-ended");
+    assert.equal(ended.length, 1);
+    assert.equal(ended[0].playbackEndVideoSec, 55);
+    assert.equal(h.video.loop, true);
+    assert.equal(h.watchVideo?.paused ?? true, true, "Retained watch-page video is never played");
+    assert.equal(h.messages.some(message => message.type === "page-error"), false);
+  }
+  console.log("PASS 55-second Shorts generate and finish through legacy or shared players despite an empty active renderer and retained watch player");
+}
+{
+  for (const missing of ["duration", "zero", "player"]) {
+    const h = generationHarness({ shorts: true, shortsLayout: "shared", duration: 55, watchDuration: 900 });
+    await h.dispatch("capture-idle");
+    if (missing === "player") h.setShortsPlayerPresent(false);
+    else { h.video.duration = missing === "zero" ? 0 : NaN; h.video.readyState = 0; }
+    h.begin.click(); await flush();
+    assert.match(h.status.textContent, /视频信息尚未加载完成/, missing);
+    assert.equal(h.status.textContent.includes("直播"), false);
+    assert.deepEqual(h.messages, [], "Unavailable Shorts metadata must not fall back to a valid hidden watch video or prepare audio");
+    assert.equal(h.playCalls, 0);
+    assert.equal(h.begin.disabled, false, "The user can explicitly retry once the Short loads");
+    h.setShortsPlayerPresent(true);
+    h.video.duration = 55;
+    h.video.readyState = 4;
+    h.video.emit("loadedmetadata"); await flush();
+    assert.deepEqual(h.messages, [], "Late metadata alone must not start any task");
+    h.begin.click(); await flush(); await flush();
+    assert.deepEqual(h.messages.map(message => message.type), ["capture-rearm", "capture-begin"]);
+    assert.equal(h.messages.at(-1).rangeEnd, 55);
+  }
+  console.log("PASS missing or unloaded Shorts metadata gives a loading message without audio setup, and an explicit retry uses the loaded Short");
+}
+{
+  const h = generationHarness({ shorts: true, shortsLayout: "shared", duration: Infinity, watchDuration: 55 });
+  await h.dispatch("capture-idle");
+  h.inputs[0].value = "0:00";
+  h.inputs[1].value = "0:55";
+  h.begin.click(); await flush();
+  assert.match(h.status.textContent, /暂不支持直播/);
+  assert.equal(h.status.textContent.includes("尚未加载"), false);
+  assert.deepEqual(h.messages, [], "A bounded form selection cannot permit an unbounded stream");
+  console.log("PASS actual unbounded Shorts remain rejected separately from metadata loading");
+}
+{
+  const h = generationHarness({ shortsLayout: "shared", duration: 55, watchDuration: 900 });
+  h.watchVideo.currentTime = 245.8;
+  await h.dispatch("capture-idle");
+  assert.deepEqual(h.inputs.slice(0, 2).map(input => input.value), ["245", ""]);
+  h.begin.click(); await flush();
+  assert.match(h.status.textContent, /填写这段的终点/);
+  assert.deepEqual(h.messages, []);
+  h.location.href = "https://www.youtube.com/shorts/ZyXwVu987_-";
+  await h.dispatch("capture-idle");
+  assert.deepEqual(h.inputs.slice(0, 2).map(input => input.value), ["0:00", "55"]);
+  h.begin.click(); await flush(); await flush();
+  assert.equal(h.messages.at(-1).rangeEnd, 55);
+  assert.equal(h.messages.findLast(message => message.type === "capture-rearm").sourceUrl, h.location.href);
+  assert.equal((await h.dispatch("prepare", { rangeStart: 0, rangeEnd: 55, batchIntervalMs: 5000 })).ok, true);
+  assert.equal((await h.dispatch("play")).ok, true);
+  h.location.href = "https://www.youtube.com/watch?v=AbCdEf012_-";
+  await h.advance(100);
+  assert.equal(h.messages.filter(message => message.type === "page-error").length, 1);
+  assert.equal(h.messages.at(-1).failure.code, "video_identity_changed");
+  await h.dispatch("capture-reset");
+  await h.dispatch("capture-idle");
+  assert.deepEqual(h.inputs.slice(0, 2).map(input => input.value), ["245", ""]);
+  const before = h.messages.length;
+  h.begin.click(); await flush();
+  assert.equal(h.messages.length, before, "Returning to a long watch video still requires an explicit endpoint");
+  h.inputs[1].value = "260";
+  h.begin.click(); await flush(); await flush();
+  assert.equal(h.messages.at(-1).type, "capture-begin");
+  assert.equal(h.messages.at(-1).rangeStart, 245);
+  assert.equal(h.messages.at(-1).rangeEnd, 260);
+  assert.equal(h.messages.findLast(message => message.type === "capture-rearm").sourceUrl, h.location.href);
+  console.log("PASS watch-to-Shorts-to-watch navigation selects each player and preserves source-change protection and long-video range requirements");
+}
+{
+  for (const failure of ["ad", "replacement"]) {
+    const h = await recording({ shorts: true, shortsLayout: "shared" });
+    if (failure === "ad") h.player.classList.add("ad-showing");
+    else h.player.replaceChildren(new FakeElement("video"));
+    await h.advance(100);
+    const errors = h.messages.filter(message => message.type === "page-error");
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0].failure.code, failure === "ad" ? "advertisement_started" : "video_replaced");
+    assert.equal(h.messages.some(message => message.type === "page-ended"), false);
+    assert.equal(h.video.paused, true);
+  }
+  console.log("PASS shared Shorts players retain real-ad and player-replacement interruption guards");
+}
+{
   let h;
   const replacement = "00000000-0000-4000-8000-000000000041";
   h = harness({ duration: 300,
@@ -1270,4 +1413,4 @@ console.log("PASS cancellation and closure ignore late learning responses and st
   assert.deepEqual(h.messages, []);
   console.log("PASS long-video idle defaults to current position and asks for an endpoint before audio preparation");
 }
-console.log("65 offline page lifecycle, layout, and learning checks passed.");
+console.log("70 offline page lifecycle, layout, and learning checks passed.");

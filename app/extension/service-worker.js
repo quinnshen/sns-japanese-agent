@@ -1,6 +1,6 @@
 const SESSION_KEY = "activeCapture";
 const API = "http://127.0.0.1:8766";
-const PAGE_VERSION = "0.6.2";
+const PAGE_VERSION = "0.6.4";
 const PAGE_PROTOCOL = 1;
 let creatingOffscreen;
 let opening = false;
@@ -10,6 +10,20 @@ const reviewRestoring = new Map();
 const REARM_BUSY = "正在连接音频，请稍候后重试。";
 const REARM_ACTIVE = "已有采集任务，请先中断／释放音频后重试。";
 const REARM_FALLBACK = "音频未连接，请点击浏览器工具栏 S，再点击生成学习内容。";
+// Audio rearm diagnostics use fixed labels, never raw browser errors,
+// stream IDs, URLs, or provider responses in the page or toolbar.
+const REARM_STAGES = Object.freeze({
+  source_changed: "当前标签页或视频已切换。请点击浏览器工具栏 S，再点击生成学习内容。",
+  page_setup: "页面连接失败。请刷新视频页面，再点击浏览器工具栏 S。",
+  panel_setup: "学习面板未响应。请刷新视频页面，再点击浏览器工具栏 S。",
+  offscreen_setup: "音频采集环境未就绪。请点击浏览器工具栏 S 后重试。",
+  tab_audio: "未取得标签页音频访问。请点击浏览器工具栏 S，再点击生成学习内容。",
+  media_connect: "连接标签页音频失败。请点击浏览器工具栏 S 后重试。",
+  video_info: "读取视频信息失败。请让视频正常播放后重试。",
+});
+function rearmFailure(code) {
+  return { ok: false, code, error: `${REARM_STAGES[code]} [${code}]` };
+}
 const BACKEND_ERRORS = Object.freeze({
   backend_unavailable: "无法连接本机服务。请先启动本机后端，确认 127.0.0.1:8766 可用后，再点击生成学习内容。",
   backend_incompatible: "本机服务响应不兼容。请更新并重启支持分批采集的本机后端，再点击生成学习内容。",
@@ -186,6 +200,7 @@ async function openAgent(tab, { freshOnly = false, rearmRequestId } = {}) {
   if (opening) return { ok: false, error: REARM_BUSY };
   opening = true;
   let session;
+  let stage = "source_changed";
   const metadata = freshOnly ? { rearmRequestId } : {};
   const notify = (tabId, text, error = false) => status(tabId, text, error, metadata);
   const configureMessage = (tabId, payload) => pageMessage(tabId, { ...payload, ...metadata });
@@ -196,10 +211,11 @@ async function openAgent(tab, { freshOnly = false, rearmRequestId } = {}) {
       if (reviewOpening.has(tab.id) || reviewRestoring.has(tab.id)) return { ok: false, error: "正在打开复习片段，请稍候。" };
       const currentTab = await chrome.tabs.get(tab.id);
       if (currentTab.id !== tab.id || currentTab.active !== true || currentTab.url !== tab.url) {
-        return { ok: false, error: REARM_FALLBACK };
+        return rearmFailure("source_changed");
       }
       tab = currentTab;
     }
+    stage = "page_setup";
     await ensurePage(tab.id);
     const active = (await chrome.storage.session.get(SESSION_KEY))[SESSION_KEY];
     // Reconnect never inspects, releases, resumes, or replaces an existing queue.
@@ -267,20 +283,24 @@ async function openAgent(tab, { freshOnly = false, rearmRequestId } = {}) {
       transcriptionEnabled: health.capabilities?.capture_transcription === true,
       enrichmentEnabled: health.capabilities?.capture_enrichment === true && health.capabilities?.capture_transcription === true };
     await chrome.storage.session.set({ [SESSION_KEY]: session });
+    stage = "panel_setup";
     const configuring = await within(configureMessage(tab.id, { type: "capture-configuring", ...session }),
       3000, "采集准备界面未响应。");
     if (configuring?.ok !== true) throw new Error("采集准备已取消。");
     await notify(tab.id, "正在准备音频采集环境…若视频尚未加载，请先让它正常播放。");
+    stage = "offscreen_setup";
     await ensureOffscreen();
     await checkCurrent(session);
     await notify(tab.id, "正在请求当前标签页的音频访问…");
     // Obtain and immediately consume the short-lived stream ID. The user first
     // authorizes this tab through the toolbar; a panel reconnect may reuse that grant.
     // The recorder starts only after the user confirms the selected range in the panel.
+    stage = "tab_audio";
     const streamId = await within(chrome.tabCapture.getMediaStreamId({ targetTabId: tab.id }), 10_000,
       "请求标签页音频访问超时。请先正常播放视频，再重新点击扩展图标。");
     await checkCurrent(session);
     await notify(tab.id, "正在连接标签页音频与扬声器…");
+    stage = "media_connect";
     const armed = await within(offscreenMessage({ type: "capture-arm", ...session, streamId }), 16_000,
       "音频准备超时。请先正常播放视频，再重新点击扩展图标。");
     if (!armed?.ok) throw new Error(armed?.error || "无法准备标签页音频");
@@ -288,6 +308,7 @@ async function openAgent(tab, { freshOnly = false, rearmRequestId } = {}) {
     session.phase = "ready";
     await chrome.storage.session.set({ [SESSION_KEY]: session });
     await notify(tab.id, "音频已连接，正在读取视频信息…");
+    stage = "video_info";
     const reply = await within(configureMessage(tab.id, { type: "capture-configure", ...session }), 12_000,
       "视频信息读取超时，请先正常播放视频后重试。");
     if (!reply?.ok) throw new Error(reply?.error || "无法读取视频；请先让视频正常播放后重试。");
@@ -302,13 +323,14 @@ async function openAgent(tab, { freshOnly = false, rearmRequestId } = {}) {
     return { ok: true, sessionId: session.sessionId };
   } catch (error) {
     const backendMessage = Object.prototype.hasOwnProperty.call(BACKEND_ERRORS, error?.code) ? BACKEND_ERRORS[error.code] : null;
-    const failure = backendMessage || (freshOnly ? REARM_FALLBACK : `准备失败：${error.message}`);
+    const diagnostic = freshOnly && !backendMessage ? rearmFailure(stage) : null;
+    const failure = backendMessage || diagnostic?.error || `准备失败：${error.message}`;
     if (tab.id) await notify(tab.id, failure, true).catch(() => {});
     if (session) {
       await within(offscreenMessage({ type: "capture-abort", sessionId: session.sessionId }), 3000, "音频准备取消超时").catch(() => {});
       await finish(session);
     }
-    return { ok: false, error: failure };
+    return { ok: false, error: failure, ...(diagnostic ? { code: diagnostic.code } : {}) };
   } finally { opening = false; }
 }
 
@@ -707,14 +729,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message.type === "capture-rearm") {
     if (sender.id !== chrome.runtime.id || !Number.isSafeInteger(sender.tab?.id) || sender.tab.id <= 0 ||
-        sender.frameId !== 0 || !validVideoUrl(sender.url) ||
+        sender.frameId !== 0 || !validVideoUrl(sender.url) || !validVideoUrl(message.sourceUrl) ||
+        !validVideoUrl(sender.tab.url) || sender.tab.url !== message.sourceUrl ||
         !Number.isSafeInteger(message.requestId) || message.requestId <= 0 || message.requestId > 1_000_000_000) {
       sendResponse({ ok: false, error: REARM_FALLBACK });
       return;
     }
-    // Derive the target exclusively from the isolated page's verified sender.
-    // openAgent rechecks the active tab after any in-progress release settles.
-    openAgent({ id: sender.tab.id, url: sender.url }, { freshOnly: true, rearmRequestId: message.requestId })
+    // sender.url identifies the sending document; a same-document navigation can
+    // leave it on the previous route. Bind the page's current selection to Chrome's
+    // tab snapshot, then recheck the active tab after any release has settled.
+    // The requested tab ID is never accepted from the message payload.
+    openAgent({ id: sender.tab.id, url: message.sourceUrl }, { freshOnly: true, rearmRequestId: message.requestId })
       .then(sendResponse).catch(() => sendResponse({ ok: false, error: REARM_FALLBACK }));
     return true;
   }

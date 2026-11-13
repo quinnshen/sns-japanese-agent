@@ -8,7 +8,7 @@ const extensionId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const origin = `chrome-extension://${extensionId}/`;
 const videoUrl = "https://www.youtube.com/watch?v=AbCdEf012_-";
 const tab = { id: 7, url: videoUrl, active: true };
-const pageMetadata = { ok: true, version: "0.6.2", protocol: 1 };
+const pageMetadata = { ok: true, version: "0.6.4", protocol: 1 };
 const tick = async () => { for (let i = 0; i < 120; i++) await Promise.resolve(); };
 async function until(check) { for (let i = 0; i < 20; i++) { if (check()) return; await tick(); } assert.ok(check(), "Lifecycle did not reach expected state"); }
 function deferred() { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; }
@@ -25,7 +25,7 @@ function workerHarness({ initial, documentExists = false, inspect = { ok: true, 
   handshakeReply = pageMetadata, statusUnavailable = false, enrichmentEnabled = false,
   learningReply = {}, latestLearningReply = learningReply, currentTabUrl = videoUrl,
   currentTabActive = true, currentTabId = tab.id, closeDocument, configuringReply = { ok: true }, prepareReply,
-  libraryReply = {}, favoriteReply = { saved: true }, reviewStatus = 200, failUpdate = false, healthResponse } = {}) {
+  libraryReply = {}, favoriteReply = { saved: true }, reviewStatus = 200, failUpdate = false, healthResponse, createDocumentFailure, armReply = { ok: true }, configureReply = { ok: true } } = {}) {
   const timer = clock(); let action; let listener; let updated; let removed; let stored = initial; let contexts = documentExists;
   const pending = new Map(); const navigations = [];
   let pageSessionId;
@@ -44,6 +44,7 @@ function workerHarness({ initial, documentExists = false, inspect = { ok: true, 
       onMessage: { addListener(fn) { listener = fn; } },
       async sendMessage(message) {
         offscreenMessages.push(structuredClone(message));
+        if (message.type === "capture-arm") return armReply;
         if (message.type === "capture-inspect") return typeof inspect === "function" ? inspect() : inspect;
         if (message.type === "capture-abort") return stallAbort ? new Promise(() => {}) : { ok: true, abortConfirmed: true };
         return { ok: true };
@@ -63,7 +64,7 @@ function workerHarness({ initial, documentExists = false, inspect = { ok: true, 
       lifecycle.push("inject"); injections.push(structuredClone(value));
       return typeof injectionResults === "function" ? injectionResults() : structuredClone(injectionResults);
     } },
-    offscreen: { async createDocument() { lifecycle.push("create-offscreen"); contexts = true; createCount++; }, async closeDocument() { closeCount++; if (closeDocument) await closeDocument(); contexts = false; } },
+    offscreen: { async createDocument() { lifecycle.push("create-offscreen"); if (createDocumentFailure) throw new Error(createDocumentFailure); contexts = true; createCount++; }, async closeDocument() { closeCount++; if (closeDocument) await closeDocument(); contexts = false; } },
     tabCapture: { async getMediaStreamId(options) { lifecycle.push("stream"); streamCalls++; streamArguments.push(structuredClone(options)); return streamId ? streamId(streamCalls) : "synthetic-stream"; } },
     tabs: {
       async get(id) { tabGets.push(id); return { ...tab, id: currentTabId, url: currentTabUrl, active: currentTabActive }; },
@@ -83,6 +84,7 @@ function workerHarness({ initial, documentExists = false, inspect = { ok: true, 
         if (message.type === "capture-configuring") {
           return typeof configuringReply === "function" ? configuringReply() : structuredClone(configuringReply);
         }
+        if (message.type === "capture-configure") return configureReply;
         if (message.type === "prepare") return prepareReply || { ok: true, duration: 100, url: currentTabUrl,
           rangeStart: message.rangeStart, rangeEnd: message.rangeEnd, batchIntervalMs: message.batchIntervalMs };
         if (statusUnavailable && message.type === "status") throw new Error("Receiving end does not exist.");
@@ -112,12 +114,13 @@ function workerHarness({ initial, documentExists = false, inspect = { ok: true, 
   });
   vm.runInContext(workerSource, context);
   const message = (payload, senderOverride = {}) => new Promise((resolve) => {
-    listener({ target: "worker", ...payload }, { id: extensionId, tab, frameId: 0, ...senderOverride }, resolve);
+    listener({ target: "worker", ...(payload.type === "capture-rearm" ? { sourceUrl: videoUrl } : {}), ...payload }, { id: extensionId, tab, frameId: 0, ...senderOverride }, resolve);
   });
   return { timer, pageMessages, offscreenMessages, fetches, fetchOptions, injections, badges, titles, lifecycle, pageTargets, streamArguments, tabGets, navigations, pending,
+    navigate(url) { currentTabUrl = url; },
     load(url = currentTabUrl) { updated(tab.id, { status: "complete" }, { ...tab, url }); },
     remove() { removed(tab.id); },
-    arm: (requestId = 1) => message({ type: "capture-rearm", requestId }, { url: currentTabUrl }),
+    arm: (requestId = 1) => message({ type: "capture-rearm", requestId, sourceUrl: currentTabUrl }, { url: currentTabUrl, tab: { ...tab, url: currentTabUrl } }),
     click: (clickedTab = tab) => action(clickedTab), get stored() { return stored; }, get closeCount() { return closeCount; }, get streamCalls() { return streamCalls; },
     get pageSessionId() { return pageSessionId; },
     get createCount() { return createCount; }, get contextCalls() { return contextCalls; },
@@ -750,7 +753,7 @@ function readySentence(overrides = {}) {
     assert.equal(h.offscreenMessages.length, 0);
     assert.equal(h.stored, undefined);
   }
-  console.log("PASS rearm verifies the active current tab and exact sender URL before page or audio setup");
+  console.log("PASS rearm verifies the active current tab and exact selected URL before page or audio setup");
 }
 {
   for (const first of ["panel", "toolbar"]) {
@@ -810,7 +813,8 @@ function readySentence(overrides = {}) {
   } });
   const reply = await h.message({ type: "capture-rearm", requestId: 1 }, { url: videoUrl });
   assert.equal(reply.ok, false);
-  assert.equal(reply.error, "音频未连接，请点击浏览器工具栏 S，再点击生成学习内容。");
+  assert.equal(reply.code, "tab_audio");
+  assert.match(reply.error, /未取得标签页音频访问/);
   assert.equal(JSON.stringify(reply).includes("synthetic-private-marker"), false);
   assert.equal(JSON.stringify(h.titles).includes("synthetic-private-marker"), false);
   assert.equal(h.stored, undefined);
@@ -876,7 +880,7 @@ function readySentence(overrides = {}) {
     const h = workerHarness({ configuringReply });
     const reply = await h.message({ type: "capture-rearm", requestId: 28 }, { url: videoUrl });
     assert.equal(reply.ok, false);
-    assert.match(reply.error, /请点击浏览器工具栏 S，再点击生成学习内容/);
+    assert.equal(reply.code, "panel_setup");
     assert.equal(h.stored, undefined);
     assert.equal(h.createCount, 0);
     assert.equal(h.streamCalls, 0);
@@ -902,6 +906,64 @@ function readySentence(overrides = {}) {
   assert.equal(h.streamCalls, 0);
   assert.equal(h.offscreenMessages.some((message) => message.type === "capture-arm"), false);
   console.log("PASS a timed-out configuring acknowledgement cannot revive a closed or cancelled rearm when it arrives late");
+}
+{
+  const shortUrl = "https://www.youtube.com/shorts/ZyXwVu987_-";
+  const watchUrl = `${videoUrl}&list=PLsample&index=17&t=496s`;
+  for (const documentUrl of [shortUrl, videoUrl]) {
+    const h = workerHarness();
+    for (const selectedUrl of [watchUrl, shortUrl, watchUrl]) {
+      h.navigate(selectedUrl);
+      const sender = { url: documentUrl, tab: { ...tab, url: selectedUrl } };
+      const reply = await h.message({ type: "capture-rearm", requestId: 1, sourceUrl: selectedUrl, tabId: 999 }, sender);
+      assert.equal(reply.ok, true, `${documentUrl} -> ${selectedUrl}`);
+      assert.equal(h.stored.sourceUrl, selectedUrl);
+      assert.equal(h.stored.tabId, tab.id, "The payload cannot select another tab");
+      assert.equal(h.offscreenMessages.at(-1).type, "capture-arm");
+      assert.equal(h.fetches.every(url => new URL(url).pathname === "/health"), true,
+        "Audio preparation must not create a recording or invoke cloud services");
+      await h.message({ type: "capture-cancel", sessionId: reply.sessionId }, sender);
+      assert.equal(h.stored, undefined);
+    }
+    assert.equal(h.streamCalls, 3);
+    assert.equal(h.closeCount, 3);
+    assert.equal(h.offscreenMessages.some(message => message.type === "capture-start"), false);
+  }
+  console.log("PASS same-document watch/Shorts/watch navigation arms and releases audio against the current selected tab, including playlist and timestamp URLs");
+}
+{
+  for (const sourceUrl of [undefined, null, videoUrl + "&t=123", "https://example.invalid/watch?v=AbCdEf012_-", 7]) {
+    const h = workerHarness();
+    assert.equal((await h.message({ type: "capture-rearm", requestId: 1, sourceUrl }, { url: videoUrl })).ok, false);
+    assert.equal(h.tabGets.length, 0);
+    assert.equal(h.fetches.length, 0);
+    assert.equal(h.streamCalls, 0);
+  }
+  const h = workerHarness({ currentTabUrl: videoUrl + "&t=123" });
+  const rejected = await h.message({ type: "capture-rearm", requestId: 1, sourceUrl: videoUrl }, { url: videoUrl });
+  assert.equal(rejected.code, "source_changed", "Navigation after message dispatch remains rejected");
+  assert.equal(h.streamCalls, 0);
+  console.log("PASS rearm rejects missing, forged, stale and navigated selections without acquiring audio");
+}
+{
+  const privateMarker = "synthetic-private-marker";
+  for (const [options, code] of [
+    [{ injectionResults: () => { throw new Error(privateMarker); } }, "page_setup"],
+    [{ createDocumentFailure: privateMarker }, "offscreen_setup"],
+    [{ armReply: { ok: false, error: privateMarker } }, "media_connect"],
+    [{ configureReply: { ok: false, error: privateMarker } }, "video_info"],
+  ]) {
+    const h = workerHarness(options);
+    const reply = await h.arm();
+    assert.equal(reply.ok, false);
+    assert.equal(reply.code, code);
+    assert.equal(reply.error.includes(`[${code}]`), true);
+    assert.equal(JSON.stringify([reply, h.titles, h.pageMessages]).includes(privateMarker), false);
+    assert.equal(h.stored, undefined);
+    assert.equal(h.offscreenMessages.some(message => message.type === "capture-start"), false);
+    assert.equal(h.fetches.every(url => new URL(url).pathname === "/health"), true);
+  }
+  console.log("PASS audio preparation failures expose fixed stages without browser errors, URLs, stream IDs or cloud requests");
 }
 const reviewId = "00000000-0000-4000-8000-000000000077";
 const reviewTarget = "https://www.youtube.com/shorts/ZyXwVu987_-";
@@ -1034,4 +1096,4 @@ console.log("PASS pre-roll and mid-capture ad interruption retain a bounded code
   assert.equal(h.streamCalls, 0);
   console.log("PASS missing review APIs explain backend restart while a real empty library remains a successful empty result");
 }
-console.log("50 preparation, recovery, review, learning, status, and failure lifecycle checks passed.");
+console.log("53 preparation, recovery, review, learning, status, and failure lifecycle checks passed.");
